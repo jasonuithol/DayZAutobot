@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 - 2026-11-24
 
 - CLI: `-h`/`--help` after a command prints the help instead of running the command (`cycle --help`
   used to rebuild and restart everything), an unknown `--option` is an error instead of being

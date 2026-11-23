@@ -7,7 +7,7 @@
 // then. Commands come from registrars in the World module (never reloaded) and the Mission module
 // (re-registered after each reload; a Mission command still running at a reload is failed).
 
-const string AB_VERSION = "0.2.0";
+const string AB_VERSION = "0.2.1";
 
 void AB_Log(string msg)
 {
