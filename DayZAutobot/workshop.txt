@@ -1,0 +1,16 @@
+A test-automation mod for DayZ modders. Load it on a local test server and on a client, and a script (or an AI coding assistant) can play the game for you: join, walk, look around, pick things up, use items through the game's own action keys, spawn and teleport, and read back exactly what happened, so you can test your mod without sitting at the keyboard.
+
+[h2]What it does[/h2]
+[list]
+[*] Drives the player: move, turn, aim, change stance, walk to a point.
+[*] Uses the real action system: the same F / left mouse presses a player makes, so your mod's actions, conditions and client/server flow are tested for real.
+[*] Explains actions: lists what the game offers for any object, and for the ones it doesn't, which condition blocks them (too far, wrong item in hands, ruined...).
+[*] Observes: player state, inventory trees, nearby objects, menus and buttons.
+[*] Server helpers: spawn anything (on the ground, in hands, in inventory), teleport, heal, god mode, time of day, weather, and run script on the server.
+[/list]
+
+[h2]Is it safe?[/h2]
+The mod does nothing at all unless the game is started with the -autobot launch parameter, which no normal client or server uses. It only talks to its own computer (localhost), never to the internet, and a server only lets a player steer their own character with it when that server was itself started with -autobot. Don't run it on a public server: it's meant for your own local test server.
+
+[h2]What you need[/h2]
+It's driven by a companion command-line tool that launches the client and the test server and sends the commands. On its own, this mod sits idle.

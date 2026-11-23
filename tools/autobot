@@ -362,6 +362,8 @@ def pack_pbo(src, prefix, dest):
     for root, dirs, names in os.walk(src):
         dirs.sort()
         for n in sorted(names):
+            if Path(root) == Path(src) and (n.startswith("workshop.") or n in ("preview.png", "CHANGELOG.md")):
+                continue  # Workshop metadata, not mod content (as DayZMissions' build_mod.py)
             full = Path(root) / n
             files.append((str(full.relative_to(src)).replace("/", "\\"), full.read_bytes()))
     entry = lambda fname, packing, size: fname.encode() + b"\0" + struct.pack("<IIIII", packing, size, 0, 0, size)
@@ -378,6 +380,9 @@ def pack_pbo(src, prefix, dest):
 def build():
     mod = BUILD / "@DayZAutobot"
     n = pack_pbo(MOD_SRC, "DayZAutobot", mod / "addons" / "dayzautobot.pbo")
+    wid = MOD_SRC / "workshop.id"
+    if wid.exists():  # what the DayZ launcher / DZSA read to tie the folder to its Workshop item
+        (mod / "meta.cpp").write_text('protocol = 1;\npublishedid = %s;\nname = "DayZAutobot";\n' % wid.read_text().strip())
     # sign with the tarbaby key when DayZMissions' signer and the key are available (optional:
     # the throwaway server doesn't verify signatures)
     signer = Path.home() / "Projects/DayZMissions/tools/sign_pbo.sh"
