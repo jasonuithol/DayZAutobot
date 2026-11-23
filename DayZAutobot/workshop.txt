@@ -2,15 +2,71 @@ A test-automation mod for DayZ modders. Load it on a local test server and on a 
 
 [h2]What it does[/h2]
 [list]
+[*] Starts a throwaway local test server and an automated client, both with the mods you're testing.
 [*] Drives the player: move, turn, aim, change stance, walk to a point.
 [*] Uses the real action system: the same F / left mouse presses a player makes, so your mod's actions, conditions and client/server flow are tested for real.
 [*] Explains actions: lists what the game offers for any object, and for the ones it doesn't, which condition blocks them (too far, wrong item in hands, ruined...).
-[*] Observes: player state, inventory trees, nearby objects, menus and buttons.
+[*] Observes: player state, inventory trees, nearby objects, menus and buttons, screenshots, script logs.
 [*] Server helpers: spawn anything (on the ground, in hands, in inventory), teleport, heal, god mode, time of day, weather, and run script on the server.
 [/list]
 
-[h2]Is it safe?[/h2]
-The mod does nothing at all unless the game is started with the -autobot launch parameter, which no normal client or server uses. It only talks to its own computer (localhost), never to the internet, and a server only lets a player steer their own character with it when that server was itself started with -autobot. Don't run it on a public server: it's meant for your own local test server.
+[h2]The command-line tool[/h2]
+Everything is driven by [b]autobot[/b], a Python script that comes with this download:
+[code]<Steam library>/steamapps/workshop/content/221100/3844648914/extras/autobot[/code]
+usually [b]~/.steam/steam/steamapps/workshop/content/221100/3844648914/extras/autobot[/b]. It launches the client and the test server, loads this mod on both from that folder, and sends the commands. Every command prints JSON, so scripts and AI assistants can read the results.
 
-[h2]What you need[/h2]
-It's driven by a companion command-line tool that launches the client and the test server and sends the commands. On its own, this mod sits idle.
+[h2]Requirements[/h2]
+[list]
+[*] Linux. The tool runs DayZ through Proton; Windows isn't supported.
+[*] Steam running and logged in, with DayZ and DayZ Server installed (DayZ Server is under Library > Tools).
+[*] Proton: any Proton installed in Steam, or GE-Proton in compatibilitytools.d.
+[*] Python 3.8 or newer, and ImageMagick for screenshots.
+[*] KDE Plasma 6 (kwin_wayland and Spectacle) to run the client invisibly. Elsewhere, add --display desktop to launch: the game then opens a normal window.
+[/list]
+
+[h2]Getting started[/h2]
+Subscribe, let Steam download it, then in a terminal (adjust the path if DayZ is in another Steam library):
+[code]
+alias autobot='python3 ~/.steam/steam/steamapps/workshop/content/221100/3844648914/extras/autobot'
+autobot server-start                    # throwaway server on port 2402, about a minute
+autobot launch --connect 127.0.0.1      # the automated client joins it, about a minute
+autobot status                          # ingame, position...
+autobot server spawn type=Canteen dist=1.5
+autobot actions target=Canteen          # what the game offers for it
+autobot action name=ActionTakeItem target=Canteen     # presses F, like a player
+autobot player                          # the canteen is in your hands
+autobot screenshot width=960            # prints the path of a PNG
+autobot kill                            # stop the client
+autobot server-stop                     # stop the server
+[/code]
+
+[h2]Testing your own mod[/h2]
+[list]
+[*] Build your mod into an @YourMod folder (with addons/ inside) and give it to both the server and the client: [b]autobot server-start --mods /path/to/@YourMod[/b] and [b]autobot launch --mods /path/to/@YourMod --connect 127.0.0.1[/b]. Several mods: separate them with commas. Subscribed Workshop mods work too, by id or by @Name.
+[*] The test server doesn't check signatures and runs without BattlEye, so unsigned builds load.
+[*] After rebuilding your mod: [b]autobot cycle[/b] restarts the server and the client with the same mods and rejoins.
+[*] Script errors that stop the game compiling are printed by server-start / launch straight away. [b]autobot log[/b] shows the client's script log, [b]autobot log --server[/b] the server's.
+[*] Your own test mission: [b]autobot server-start --mission /path/to/mymission.chernarusplus[/b] (its files go over the vanilla offline mission). [b]--wipe[/b] starts the test world fresh.
+[/list]
+
+[h2]More commands[/h2]
+[b]autobot help[/b] lists every in-game command with its arguments; [b]autobot --help[/b] lists the tool's own. Prefix a command with [b]server[/b] to send it to the test server. A few more:
+[list]
+[*] Moving: look yaw=90, look at=Canteen, move secs=2, move_to x=11950 z=3430, stance value=crouch
+[*] Items: take item=Apple, hands item=Apple, hands item=none, drop, inventory, nearby radius=20
+[*] Actions: actions why=true (why each action is or isn't offered), action name=ActionDrink hold=3
+[*] Server: server heal, server god, server teleport x= z=, server time hour=12, server weather preset=clear, server kill, server players
+[*] Server script: server exec code='return GetGame().GetMission().ClassName();'
+[*] Menus: disconnect, connect, respawn, ui, click name=, hud show=false
+[/list]
+
+[h2]Good to know[/h2]
+[list]
+[*] The client plays as your Steam account, so you can't play DayZ yourself while it runs.
+[*] It has its own settings, key bindings and logs (under ~/.local/share/DayZAutobot) and doesn't touch your normal game's settings. DayZ keeps some profile files in Steam Cloud storage; the tool saves those before the client starts and puts them back after it exits.
+[*] The test server is separate from any server you run: its own mission (autobot.chernarusplus), config file, ports (2402, query 27116) and shard id.
+[*] Running script with exec only works on the server: the normal game client won't compile script while it runs.
+[/list]
+
+[h2]Is it safe?[/h2]
+The mod does nothing at all unless the game is started with the -autobot launch parameter, which no normal client or server uses. It only talks to its own computer (localhost), never to the internet, and a server only lets a player steer their own character with it when that server was itself started with -autobot. Don't put it on a public server: it's meant for your own local test server.

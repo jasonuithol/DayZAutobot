@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 - 2026-11-23
+
+- The command-line tool now ships with the mod (`extras/autobot` in the Workshop download) and runs
+  from there: it loads the downloaded mod folder as is instead of building it.
+- Finds DayZ, DayZ Server, Proton and Workshop mods in any Steam library (not just one Steam folder),
+  and falls back to Valve's Proton when no GE-Proton is installed.
+- The Workshop page explains where the tool is and how to use it.
+
 ## 0.1.0 - 2026-11-23
 
 First version.

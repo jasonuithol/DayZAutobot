@@ -29,4 +29,8 @@ Automation mod for the DayZ client and a throwaway server, plus its CLI. To *use
 - Never touch the user's real game: the bot has its own prefix, profiles and display; the server its own
   mission/config/ports/shard. Steam Cloud files are snapshotted at launch and restored after exit.
   Don't connect the bot to the user's VPS or public servers.
-- Version lives in `AB_VERSION` (AB_Core.c), history in `CHANGELOG.md`.
+- Version lives in `AB_VERSION` (AB_Core.c), history in `CHANGELOG.md`; bump both and tag `vX.Y.Z` together.
+- The Workshop download ships `tools/autobot` as `extras/autobot` (a symlink in `DayZAutobot/extras/`, copied
+  at build). Keep it working "installed" (`INSTALLED` = it sits in a mod folder): no repo paths, no build.
+  Workshop text is `DayZAutobot/workshop.txt` (no GitHub links, no double quotes); releasing: README "Workshop".
+  Only the user uploads (Steam Guard); never run workshop_publish.sh yourself.

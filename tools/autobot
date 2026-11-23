@@ -37,9 +37,56 @@ from urllib.parse import urlparse, parse_qs
 REPO = Path(__file__).resolve().parent.parent
 MOD_SRC = REPO / "DayZAutobot"
 BUILD = REPO / "build"
+# Run from a downloaded mod (Workshop: <library>/steamapps/workshop/content/221100/<id>/extras/autobot)
+# the mod folder itself is loaded as is; run from the git repo, the mod is built from source.
+INSTALLED = (REPO / "addons" / "dayzautobot.pbo").exists()
 HOME = Path(os.environ.get("AUTOBOT_HOME", Path.home() / ".local/share/DayZAutobot"))
-STEAM = Path(os.environ.get("STEAM", Path.home() / ".steam/debian-installation"))
-WORKSHOP = STEAM / "steamapps/workshop/content/221100"
+def _steam_roots():
+    h = Path.home()
+    cands = [Path(os.environ["STEAM"])] if os.environ.get("STEAM") else []
+    cands += [h / ".steam/debian-installation", h / ".steam/steam", h / ".local/share/Steam",
+              h / ".var/app/com.valvesoftware.Steam/.local/share/Steam"]
+    out, seen = [], set()
+    for c in cands:
+        if (c / "steamapps").is_dir() and c.resolve() not in seen:
+            seen.add(c.resolve())
+            out.append(c)
+    return out
+
+
+def _steam_libraries():
+    libs = []
+    for root in _steam_roots():
+        libs.append(root)
+        try:
+            text = (root / "steamapps/libraryfolders.vdf").read_text(errors="replace")
+        except OSError:
+            continue
+        libs += [Path(m.group(1)) for m in re.finditer(r'"path"\s+"([^"]+)"', text)]
+    out, seen = [], set()
+    for l in libs:
+        if (l / "steamapps").is_dir() and l.resolve() not in seen:
+            seen.add(l.resolve())
+            out.append(l)
+    return out
+
+
+STEAM_ROOTS = _steam_roots()
+STEAM = STEAM_ROOTS[0] if STEAM_ROOTS else Path.home() / ".steam/steam"   # the Steam client's own folder
+LIBRARIES = _steam_libraries()
+
+
+def find_common(folder):
+    """steamapps/common/<folder> in whichever Steam library has it (default: the main one)."""
+    for lib in LIBRARIES:
+        if (lib / "steamapps/common" / folder).is_dir():
+            return lib / "steamapps/common" / folder
+    return STEAM / "steamapps/common" / folder
+
+
+def workshop_dirs():
+    return [l / "steamapps/workshop/content/221100" for l in LIBRARIES
+            if (l / "steamapps/workshop/content/221100").is_dir()]
 PORT = int(os.environ.get("AUTOBOT_PORT", "7879"))
 SERVER_PORT = int(os.environ.get("AUTOBOT_SERVER_PORT", "2402"))
 SERVER_QUERY_PORT = SERVER_PORT + 24714  # 27116 for 2402
@@ -62,19 +109,36 @@ def die(msg, code=1):
 
 def game_dirs(game):
     client, server, appid = GAMES[game]
-    return STEAM / "steamapps/common" / client, STEAM / "steamapps/common" / server, appid
+    return find_common(client), find_common(server), appid
+
+
+def _version_key(name):
+    return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", name)]
 
 
 def proton_dir():
-    name = os.environ.get("PROTON")
-    tools = STEAM / "compatibilitytools.d"
-    if not name:
-        found = sorted((p.name for p in tools.glob("*") if "proton" in p.name.lower()),
-                       key=lambda s: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", s)])
-        if not found:
-            die(f"no Proton build in {tools}")
-        name = found[-1]
-    return tools / name
+    """PROTON (a name or a path), else the newest GE-Proton in compatibilitytools.d, else Valve's
+    Proton from the Steam libraries (Experimental first, then the highest version)."""
+    want = os.environ.get("PROTON")
+    if want and Path(want).is_absolute():
+        return Path(want)
+    custom = [p for r in STEAM_ROOTS for p in (r / "compatibilitytools.d").glob("*")
+              if "proton" in p.name.lower() and (p / "proton").exists()]
+    valve = [p for l in LIBRARIES for p in (l / "steamapps/common").glob("Proton*")
+             if (p / "proton").exists() and "BattlEye" not in p.name and "EasyAntiCheat" not in p.name]
+    if want:
+        for p in custom + valve:
+            if p.name == want:
+                return p
+        die(f"no Proton called {want}")
+    if custom:
+        return sorted(custom, key=lambda p: _version_key(p.name))[-1]
+    exp = [p for p in valve if "Experimental" in p.name]
+    if exp:
+        return exp[0]
+    if valve:
+        return sorted(valve, key=lambda p: _version_key(p.name))[-1]
+    die("no Proton found: install one in Steam (Library > Tools > Proton), or set PROTON=")
 
 
 def winpath(p):
@@ -360,6 +424,8 @@ def wait_for_target(target, secs, state=None, prof=None, since=None, proc=None, 
 def pack_pbo(src, prefix, dest):
     files = []
     for root, dirs, names in os.walk(src):
+        if Path(root) == Path(src) and "extras" in dirs:
+            dirs.remove("extras")  # shipped beside addons/, not packed (as build_mod.py)
         dirs.sort()
         for n in sorted(names):
             if Path(root) == Path(src) and (n.startswith("workshop.") or n in ("preview.png", "CHANGELOG.md")):
@@ -377,9 +443,24 @@ def pack_pbo(src, prefix, dest):
     return len(files)
 
 
+def autobot_mod():
+    """The @DayZAutobot folder to load: this download itself, or the repo's build (built if missing)."""
+    if INSTALLED:
+        return REPO
+    if not (BUILD / "@DayZAutobot/addons/dayzautobot.pbo").exists():
+        build()
+    return BUILD / "@DayZAutobot"
+
+
 def build():
+    if INSTALLED:
+        return {"ok": False, "error": "this is an installed copy of the mod: nothing to build (it loads itself)"}
     mod = BUILD / "@DayZAutobot"
     n = pack_pbo(MOD_SRC, "DayZAutobot", mod / "addons" / "dayzautobot.pbo")
+    if (mod / "extras").exists():
+        shutil.rmtree(mod / "extras")
+    if (MOD_SRC / "extras").is_dir():
+        shutil.copytree(MOD_SRC / "extras", mod / "extras")  # follows the symlink: a real copy of the CLI
     wid = MOD_SRC / "workshop.id"
     if wid.exists():  # what the DayZ launcher / DZSA read to tie the folder to its Workshop item
         (mod / "meta.cpp").write_text('protocol = 1;\npublishedid = %s;\nname = "DayZAutobot";\n' % wid.read_text().strip())
@@ -404,10 +485,11 @@ def resolve_mod(spec):
     p = Path(spec).expanduser()
     if p.is_dir():
         return p.resolve()
-    if spec.isdigit() and (WORKSHOP / spec).is_dir():
-        return WORKSHOP / spec
+    for ws in workshop_dirs():
+        if spec.isdigit() and (ws / spec).is_dir():
+            return ws / spec
     if spec.startswith("@"):
-        for d in WORKSHOP.iterdir() if WORKSHOP.is_dir() else []:
+        for d in [d for ws in workshop_dirs() for d in ws.iterdir()]:
             meta = d / "meta.cpp"
             if meta.exists() and re.search(r'name\s*=\s*"%s"' % re.escape(spec[1:]), meta.read_text(errors="replace")):
                 return d
@@ -430,7 +512,7 @@ def link_mods(game_dir, specs, lower):
     link_root.mkdir(exist_ok=True)
     entries = []
     for spec in specs:
-        path = BUILD / "@DayZAutobot" if spec == "autobot" else resolve_mod(spec)
+        path = autobot_mod() if spec == "autobot" else resolve_mod(spec)
         name = mod_name(path)
         dest = link_root / name
         if dest.is_symlink() or dest.is_file():
@@ -567,8 +649,7 @@ def launch(opts, attempt=1):
     if not exe.exists():
         die(f"not found: {exe}")
     snapshot_cloud(appid)
-    if not (BUILD / "@DayZAutobot/addons/dayzautobot.pbo").exists():
-        build()
+    autobot_mod()
     proton = proton_dir()
     idir = inst_dir(name)
     prefix = idir / "prefix"
@@ -601,7 +682,7 @@ def launch(opts, attempt=1):
     env.update(STEAM_COMPAT_CLIENT_INSTALL_PATH=str(STEAM), STEAM_COMPAT_DATA_PATH=str(prefix),
                STEAM_COMPAT_INSTALL_PATH=str(client_dir), STEAM_COMPAT_APP_ID=str(appid),
                SteamAppId=str(appid), SteamGameId=str(appid),
-               PROTON_BATTLEYE_RUNTIME=str(STEAM / "steamapps/common/Proton BattlEye Runtime"))
+               PROTON_BATTLEYE_RUNTIME=str(find_common("Proton BattlEye Runtime")))
     log = open(idir / "proton.log", "w")
     launched = time.time()
     p = subprocess.Popen([str(proton / "proton"), "waitforexitandrun", str(exe)] + args, cwd=client_dir,
@@ -737,8 +818,7 @@ def server_start(opts):
     exe = server_dir / "DayZServer"
     if not exe.exists():
         die(f"not found: {exe}")
-    if not (BUILD / "@DayZAutobot/addons/dayzautobot.pbo").exists():
-        build()
+    autobot_mod()
     ensure_bridge()
     home = server_home()
     prof = home / "profiles"
@@ -954,7 +1034,8 @@ def cycle(opts):
         kill(name)
     if had_server:
         steps["server_stop"] = server_stop()
-    steps["build"] = build()
+    if not INSTALLED:
+        steps["build"] = build()
     if had_server or opts.get("server"):
         sopts = dict(srun.get("opts", {}), **{k: v for k, v in opts.items() if k in ("mission", "mods", "server_mods", "wipe")})
         sopts.setdefault("game", opts["game"])
@@ -993,7 +1074,8 @@ def paths(opts):
     return {"ok": True, "repo": str(REPO), "home": str(HOME), "client_dir": str(client_dir), "server_dir": str(server_dir),
             "proton": str(proton_dir()), "prefix": str(inst_dir(name) / "prefix"),
             "profiles": str(profiles_dir(name)), "server_profiles": str(server_home() / "profiles"),
-            "mod_build": str(BUILD / "@DayZAutobot"), "bridge_port": PORT,
+            "autobot_mod": str(REPO if INSTALLED else BUILD / "@DayZAutobot"), "installed": INSTALLED,
+            "steam": str(STEAM), "libraries": [str(l) for l in LIBRARIES], "bridge_port": PORT,
             "server_address": f"127.0.0.1:{SERVER_PORT}", "script_log": str(newest_log(profiles_dir(name)) or "")}
 
 # ------------------------------------------------------------------ main

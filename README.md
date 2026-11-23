@@ -60,6 +60,16 @@ tools/autobot (Python CLI) ── HTTP ──▶ bridge (localhost:7879, started
   override with `STEAM=`), and a GE-Proton in `compatibilitytools.d` (`PROTON=` to pick one)
 - Optional: `~/Projects/DayZMissions/tools/sign_pbo.sh` and the `tarbaby` key to sign the PBO
 
+## Workshop
+
+Published as Workshop item 3844648914 (public). The download includes the CLI as
+`extras/autobot`; run from there (`python3 <library>/steamapps/workshop/content/221100/3844648914/extras/autobot`)
+it loads that mod folder as is and finds the games, Proton and Workshop mods in any Steam library.
+The Workshop page (`DayZAutobot/workshop.txt`) carries the usage instructions; it must not link here.
+Release: tag `vX.Y.Z` (matching `AB_VERSION` and a `CHANGELOG.md` entry), push, then from DayZMissions
+(where `mods/DayZAutobot` links to `DayZAutobot/`, git-excluded): `tools/workshop_publish.sh DayZAutobot <login>`
+(the user runs it: Steam Guard), Steam > Go Online, `tools/workshop_tags.py DayZAutobot Mod`.
+
 ## Usage
 
 ```bash
