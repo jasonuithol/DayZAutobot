@@ -70,13 +70,16 @@ echo "== control"
 check "look yaw"          '"yaw"'            $A look yaw=90
 check "look at"           'Canteen'          $A look at=Canteen
 check "actions (target=)" 'ActionTakeItem'   $A actions target=Canteen
-check "action take (F)"   '"started"'        $A action name=ActionTakeItem target=Canteen
-check "hands holds it"    '"hands": {"type": "Canteen"' $A player
+check "take (tap F)"      '"started"'        $A action name=ActionTakeItem target=Canteen
+check "it's carried"      'Canteen'          $A inventory
+check "hands"             'Canteen'          $A hands item=Canteen
 check "drink (hold LMB)"  'ActionDrink'      $A action name=ActionDrink hold=3
 check "drop"              'Canteen'          $A drop
-check "take"              'Canteen'          $A take item=Canteen to=hands
+check "take to hands (hold F)" '"started"'   $A action name=ActionTakeItemToHands target=Canteen
+check "hands holds it"    '"hands": {"type": "Canteen"' $A player
 check "drop again"        'Canteen'          $A drop
-check "hands"             'Apple'            $A hands item=Apple
+check "take"              'Canteen'          $A take item=Canteen
+check "hands (apple)"     'Apple'            $A hands item=Apple
 check "hands none"        -                  $A hands item=none
 check "stance crouch"     '"stance"'         $A stance value=crouch
 check "stance erect"      '"stance"'         $A stance value=erect
@@ -84,6 +87,29 @@ check "move"              '"moved"'          $A move secs=1 speed=2
 check "move_to"           '"dist"'           $A move_to x=11955 z=3430
 check "stop"              '"stopped"'        $A stop
 check "server delete"     '"deleted"'        $A server delete type=Canteen radius=30
+
+echo "== vehicles (north-west airfield)"
+check "teleport"          '"pos"'            $A server teleport x=4104 z=10560
+sleep 3
+check "spawn car"         'OffroadHatchback' $A server spawn type=OffroadHatchback x=4112 z=10560 full=true
+check "place car"         '"heading"'        $A server vehicle_place type=OffroadHatchback x=4112 z=10560 yaw=0
+check "service car"       '"fuel": 1'        $A server vehicle_service type=OffroadHatchback
+check "vehicle_parts"     '"door_id"'        $A vehicle_parts target=OffroadHatchback
+check "enter (driver)"    '"my_seat": 0'     $A enter target=OffroadHatchback seat=0
+check "start engine"      '"started"'        $A action name=ActionStartEngine
+check "lights on"         '"started"'        $A action name=ActionSwitchLights
+check "lights are on"     '"lights_on": true' $A vehicle
+check "horn"              -                  $A action name=ActionVehicleHornLong hold=1
+check "drive_to"          '"dist"'           $A drive_to x=4112 z=10640 speed=30
+check "drive reverse"     '"gear": "R"'      $A drive gear=R throttle=0.4 secs=2
+check "stop_vehicle"      '"speed_kmh"'      $A stop_vehicle
+check "engine off"        '"started"'        $A action name=ActionStopEngine
+check "lights off"        '"started"'        $A action name=ActionSwitchLights
+check "switch seat"       '"started"'        $A action name=ActionSwitchSeats seat=1
+check "in seat 1"         '"my_seat": 1'     $A vehicle
+check "leave"             '"pos"'            $A leave
+sleep 1
+check "remove car"        '"deleted"'     $A server delete type=OffroadHatchback radius=150
 
 echo "== menus, death and reconnect"
 check "server kill"       '"killed"'         $A server kill

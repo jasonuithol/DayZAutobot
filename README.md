@@ -12,6 +12,9 @@ keyboard. It's the DayZ counterpart of AutoHeim (Valheim).
   isn't offered (which condition fails)
 - do actions through the game's own action system (simulated F / left mouse, click or hold)
 - take, hold, drop and stash items
+- vehicles: get in and out (walking round to the right door and opening it), switch seats, doors, hood
+  and trunk, engine, lights, horn; drive cars and boats (`drive_to` steers, holds a speed, shifts a manual
+  gearbox and stops), read speed, rpm, gear, fluids and crew; service, move and unflip vehicles
 - server helpers: spawn anything (on the ground, in hands, in inventory), teleport, heal, god mode,
   kill, delete, time of day, weather
 - run arbitrary Enforce script on the server (`exec`)
@@ -38,6 +41,10 @@ tools/autobot (Python CLI) ── HTTP ──▶ bridge (localhost:7879, started
   only act on the machine that sets them, so the client mirrors its drive state to the server with
   one RPC, which the server only accepts when it runs `-autobot` (so the mod can't be used to cheat
   on a normal server).
+- **Vehicles** are driven through `Transport.OnInput`, where vanilla's own debug autopilot sets
+  throttle, steering, brakes and gears; everything else (doors, seats, engine, lights, horn) is the
+  game's actions with a forced target component (`seat=`/`component=`). Car and boat physics run on the
+  driver's client, so the client-side controls are what count (they're mirrored to the server anyway).
 - **Actions** use the real action system: the mod feeds simulated presses of the action inputs
   (UAAction = F, UADefaultAction = left mouse) into `ActionInput.Update`, and can force the action
   target through the game's own `ForceActionTarget` hook. Conditions, targeting and the client/server
@@ -149,7 +156,19 @@ the engine never calls script methods with that name.
   memory"; the launcher writes a fresh one every launch.
 - **The client writes its profile through Steam Cloud as you**, keyed by server `shardId`; the test
   server uses its own shard (`abtest`) and the launcher snapshots/restores the cloud folder.
-- The test server's process is named `enfMain`; so is the Wine client.
+- **`typename.Spawn()` objects die even when held in `ref` fields.** The registrars keep a static ref
+  to themselves; before that their per-frame hook silently never ran.
+- **Taps and holds share keys** (F = Interact tap / ContinuousInteract hold). A simulated tap must only
+  reach tap inputs, or tapping a car door also starts pushing the car; a held key must be let go the
+  moment its action ends, or the game chains the next action on it (get in, get out, get in...).
+- **Vehicles:** getting in needs the door open and the player within 1 m of the seat's door point;
+  door actions target the door attachment itself. 1.30 motorbikes ignore scripted throttle (cars and
+  boats don't); boats can't be boarded while swimming and won't shift into reverse while moving.
+- **A script that fails with "Formula too complex" crashes the server** when `exec` loads it.
+- `HumanInputController.OverrideMovementAngle` is in degrees, positive to the right; car steering is
+  positive to the right too.
+- The test server's process is named `enfMain`; so is the Wine client. Network ids change when the
+  server restarts. The headless client is capped at 60 fps (`-limitFPS`), or it renders ~550.
 
 ## Changelog
 

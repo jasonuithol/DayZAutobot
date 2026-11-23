@@ -435,6 +435,8 @@ class AB_Cmd_MoveTo : AB_PlayerCommand
 	ref AB_Aimer m_Aim = new AB_Aimer;
 	vector m_LastPos;
 	float m_StuckFor;
+	float m_Best = 1e9;
+	float m_SinceProgress;
 
 	override float DefaultTimeout()
 	{
@@ -464,10 +466,33 @@ class AB_Cmd_MoveTo : AB_PlayerCommand
 			c.R.Vec("pos", pos).Num("dist", dist);
 			return true;
 		}
+		// no progress for a while (blocked, or circling a point it can't settle on): give up
+		if (dist < m_Best - 0.3)
+		{
+			m_Best = dist;
+			m_SinceProgress = 0;
+		}
+		else
+			m_SinceProgress += dt;
+		if (m_SinceProgress > 8)
+		{
+			AB_Steer.Release(P);
+			c.R.Vec("pos", pos).Num("dist", dist);
+			return Fail("no progress for 8 s, " + dist.ToString() + " m short (blocked?)");
+		}
+		float speed = m_Speed;
+		if (dist < 2)
+		{
+			// close in by stepping toward the point without turning (turning circles it)
+			P.AB_SetHeading(false, 0);
+			float bearing = AB_Steer.YawBetween(AB_Steer.AimDir(), m_Goal - flat) * Math.RAD2DEG;
+			AB_Steer.Move(P, 1, bearing);
+			m_LastPos = pos;
+			return false;
+		}
 		m_Aim.Target = (m_Goal - flat).Normalized();
 		m_Aim.Update(P);
 		float err = Math.AbsFloat(P.AB_HeadingError());
-		float speed = m_Speed;
 		if (err > 0.6)
 			speed = 0;		// turn on the spot first
 		else if (dist < 4 && speed > 1)
@@ -704,7 +729,7 @@ class AB_Cmd_Actions : AB_PlayerCommand
 	static void Collect(ActionInput ai, array<ActionBase> found)
 	{
 		int n = ai.GetPossibleActionsCount();
-		if (n >= 0)
+		if (n > 0)
 		{
 			array<ActionBase> many = ai.GetPossibleActions();
 			for (int i = 0; i < n; i++)
@@ -713,10 +738,10 @@ class AB_Cmd_Actions : AB_PlayerCommand
 				if (a != null)
 					found.Insert(a);
 			}
-			return;
 		}
+		// some inputs (vehicle lights, horn, NVG) keep their one action apart from the list
 		ActionBase one = ai.GetPossibleAction();
-		if (one != null)
+		if (one != null && found.Find(one) < 0)
 			found.Insert(one);
 	}
 
@@ -750,12 +775,11 @@ class AB_Cmd_Actions : AB_PlayerCommand
 
 	override bool PlayerStart()
 	{
-		if (c.Has("target"))
+		if (AB_Target.Wanted(c))
 		{
-			Object o = AB_Target.Find(P, c);
-			if (o == null)
-				return Fail("no '" + c.Str("target") + "' within " + c.Num("radius", 4) + " m");
-			AB_Target.Force(P, o);
+			string err = AB_Target.ForceFrom(P, c);
+			if (err != "")
+				return Fail(err);
 			m_Frames = AB_Target.Updates(P);
 			return false;
 		}
@@ -795,7 +819,7 @@ class AB_Cmd_Actions : AB_PlayerCommand
 // offered for an object without pixel-exact aiming. The server still checks range and conditions.
 class AB_Target
 {
-	static bool Force(PlayerBase p, Object o)
+	static bool Force(PlayerBase p, Object o, int component = -1)
 	{
 		ActionManagerClient am = ActionManagerClient.Cast(p.GetActionManager());
 		if (am == null)
@@ -812,10 +836,27 @@ class AB_Target
 			string cls = inputs[i].ClassName();
 			if (cls != "ContinuousDefaultActionInput" && cls != "DefaultActionInput" && cls != "ContinuousInteractActionInput" && cls != "InteractActionInput")
 				continue;
-			ActionTarget at = new ActionTarget(o, parent, -1, o.GetPosition(), 1);
+			ActionTarget at = new ActionTarget(o, parent, component, HitPos(o, component), 1);
 			inputs[i].ForceActionTarget(at);
 		}
 		return true;
+	}
+
+	// Where the crosshair would be: the component's own selection (a door, a seat) when one is given,
+	// else the object's position. The game measures reach from this point.
+	static vector HitPos(Object o, int component)
+	{
+		if (component >= 0)
+		{
+			TStringArray names = new TStringArray;
+			o.GetActionComponentNameList(component, names);
+			foreach (string nm : names)
+			{
+				if (o.MemoryPointExists(nm) || o.GetSelectionPositionMS(nm) != vector.Zero)
+					return o.ModelToWorld(o.GetSelectionPositionMS(nm));
+			}
+		}
+		return o.GetPosition();
 	}
 
 	// how many times the game's action manager has updated (it runs at the simulation rate, slower
@@ -842,6 +883,45 @@ class AB_Target
 	static Object Find(PlayerBase p, AB_Ctx c)
 	{
 		return AB_Obj.FindNear(p.GetPosition(), c.Num("radius", 4), c.Str("target"), p);
+	}
+
+	static bool Wanted(AB_Ctx c)
+	{
+		return c.Has("target") || c.Has("seat") || c.Has("component");
+	}
+
+	// Forces the target from target= / seat= / component=: seat= picks the vehicle geometry component
+	// of that crew seat (doors, seats), and without target= means the vehicle the player sits in.
+	// Returns "" or an error.
+	static string ForceFrom(PlayerBase p, AB_Ctx c)
+	{
+		Object o;
+		if (c.Has("target"))
+		{
+			o = Find(p, c);
+			if (o == null)
+				return "no '" + c.Str("target") + "' within " + c.Num("radius", 4) + " m";
+		}
+		else
+		{
+			o = AB_Veh.Of(p);
+			if (o == null)
+				return "seat=/component= without target= needs the player in a vehicle";
+		}
+		int comp = -1;
+		if (c.Has("component"))
+			comp = c.Int("component");
+		else if (c.Has("seat"))
+		{
+			Transport t = Transport.Cast(o);
+			if (t == null)
+				return o.GetType() + " has no seats";
+			comp = AB_Veh.ComponentForSeat(t, c.Int("seat"));
+			if (comp < 0)
+				return o.GetType() + " has no seat " + c.Int("seat") + " (it has " + t.CrewSize() + ")";
+		}
+		Force(p, o, comp);
+		return "";
 	}
 }
 
@@ -884,17 +964,17 @@ class AB_Cmd_Action : AB_PlayerCommand
 			return Fail("name= required (see: actions)");
 		if (P.GetActionManager().GetRunningAction() != null)
 			return Fail("another action is running: " + P.GetActionManager().GetRunningAction().ClassName());
-		if (c.Has("target"))
+		if (AB_Target.Wanted(c))
 		{
-			Object o = AB_Target.Find(P, c);
-			if (o == null)
-				return Fail("no '" + c.Str("target") + "' within " + c.Num("radius", 4) + " m");
-			AB_Target.Force(P, o);
+			string err = AB_Target.ForceFrom(P, c);
+			if (err != "")
+				return Fail(err);
 			m_Forced = true;
-			m_ForcedAt = AB_Target.Updates(P);
-			return false;	// the inputs pick the target up on the next action-manager update
 		}
-		return Press();
+		// let the action manager (simulation rate, slower than frames) catch up with whatever just
+		// changed - a forced target, an item that just arrived in the hands - before looking
+		m_ForcedAt = AB_Target.Updates(P);
+		return false;
 	}
 
 	// find the action among what the inputs offer and press its key; true = finished (failed)
@@ -919,6 +999,8 @@ class AB_Cmd_Action : AB_PlayerCommand
 			if (m_Action != null)
 				break;
 		}
+		if (m_Action == null && c.Elapsed < c.Num("settle", 3))
+			return false;	// the game may still be busy (an item just went to the hands): look again
 		if (m_Action == null)
 		{
 			c.R.Arr("available", AB_Cmd_Actions.List(P));
@@ -935,10 +1017,14 @@ class AB_Cmd_Action : AB_PlayerCommand
 		m_Input.ForceAction(m_Action, m_Input.m_Target, m_Input.m_MainItem);
 		m_Wait = c.Bool("wait", true);
 		m_Hold = c.Num("hold", 0);
-		bool continuous = m_Input.GetInputType() == ActionInputType.AIT_CONTINUOUS || m_Input.GetInputType() == ActionInputType.AIT_CLICKCONTINUOUS;
+		// hold-type inputs get a hold, tap-type (incl. click-to-toggle) a tap
+		bool continuous = m_Input.GetInputType() == ActionInputType.AIT_CONTINUOUS || m_Input.GetInputType() == ActionInputType.AIT_HOLDSINGLE;
 		m_Key = ua.ID();
 		if (continuous)
+		{
 			AB_Input.HoldId(m_Key, m_Hold);
+			AB_Input.HoldFor(m_Action, m_Key);
+		}
 		else
 			AB_Input.ClickId(m_Key);
 		c.R.Str("action", m_Action.ClassName()).Str("text", Widget.TranslateString(m_Action.GetText())).Str("input", AB_Cmd_Actions.InputName(m_Input));
@@ -981,10 +1067,14 @@ class AB_Cmd_Action : AB_PlayerCommand
 			}
 			return false;
 		}
-		if (running != null)
+		// done once our action stops running. Let go right away: with the key still held the game
+		// chains the next action on the same key (get in -> get out -> get in...)
+		if (running == m_Action)
 			return false;
 		Done();
 		c.R.Bool("started", true).Num("secs", c.Elapsed);
+		if (running != null)
+			c.R.Str("then_running", running.ClassName());
 		return true;
 	}
 
@@ -1024,6 +1114,23 @@ class AB_Cmd_Key : AB_Command
 		if (!ok)
 			return Fail("unknown input '" + name + "' (e.g. UADefaultAction, UAAction, UAReloadMagazine)");
 		c.R.Str("note", "only action inputs (the ActionInput classes) see simulated keys");
+		return true;
+	}
+}
+
+// keys - the simulated presses currently held or pending (input id, hold, expiry)
+class AB_Cmd_Keys : AB_Command
+{
+	override bool Start()
+	{
+		AB_JArr list = new AB_JArr;
+		foreach (int id, AB_Press p : AB_Input.s_Presses)
+		{
+			AB_JObj o = new AB_JObj;
+			o.Int("input_id", id).Bool("hold", p.Hold).Num("until", p.Until).Int("click_frame", p.ClickFrame);
+			list.Obj(o);
+		}
+		c.R.Arr("presses", list).Num("now", GetGame().GetTickTime()).Int("frame", AB_Input.s_Frame);
 		return true;
 	}
 }
@@ -1171,8 +1278,9 @@ void AB_RegisterPlayerCommands(AB_Registry reg)
 	reg.Add("inventory", AB_Cmd_Inventory, "inventory [depth=4] - hands and worn items with attachments and cargo, as a tree");
 	reg.Add("nearby", AB_Cmd_Nearby, "nearby [radius=30] [type=] [kind=player|zombie|animal|item|vehicle|entity|building] [static=false] [limit=40] [x= z=] - objects sorted by distance");
 	reg.Add("target", AB_Cmd_Target, "target [range=5] - what the crosshair hits, plus the actions on offer");
-	reg.Add("actions", AB_Cmd_Actions, "actions [target=<id|type>] [why=true] - the actions the game offers now (per input), for the crosshair target or target=; why=true says which condition blocks each action the target/item defines");
-	reg.Add("action", AB_Cmd_Action, "action name=<ActionClass|text> [target=<id|type>] [hold=secs] [wait=true] - perform an offered action by pressing/holding its key");
+	reg.Add("actions", AB_Cmd_Actions, "actions [target=<id|type>] [seat=|component=] [why=true] - the actions the game offers now (per input), for the crosshair target or target=; why=true says which condition blocks each action the target/item defines");
+	reg.Add("action", AB_Cmd_Action, "action name=<ActionClass|text> [target=<id|type>] [seat=|component=] [hold=secs] [wait=true] - perform an offered action by pressing/holding its key");
+	reg.Add("keys", AB_Cmd_Keys, "keys - simulated key presses currently held or pending");
 	reg.Add("key", AB_Cmd_Key, "key name=UAAction|UADefaultAction|... [hold=secs] [release=true] - click/hold an action input");
 	reg.Add("look", AB_Cmd_Look, "look yaw= [pitch=] | x= z= [y=] | at=<id|type> - turn until aimed (yaw 0 = north, 90 = east)");
 	reg.Add("move", AB_Cmd_Move, "move [dir=forward|back|left|right] [angle=] [speed=1 walk|2 jog|3 sprint] [secs=1] - move relative to the heading");

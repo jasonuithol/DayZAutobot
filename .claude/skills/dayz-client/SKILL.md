@@ -64,15 +64,53 @@ $A kill; $A server-stop                             # when done
   target instead of relying on the crosshair (the server still checks range). Reach is 2 m:
   `move_to` the object first.
 
+## Vehicles
+
+```bash
+$A server spawn type=OffroadHatchback x= z= full=true   # assembled; full fuel/oil/coolant
+$A server vehicle_service type=OffroadHatchback         # repair everything, fill every fluid
+$A server vehicle_place type=OffroadHatchback x= z= yaw=0   # move/unflip (crew stays aboard)
+$A vehicle_parts target=OffroadHatchback   # per seat: entry point, door id/component/state; doors, hood, trunk
+$A enter target=OffroadHatchback seat=0    # walks round to the door, opens it, holds F to get in (0 = driver)
+$A action name=ActionStartEngine           # engine (bikes: ActionStartEngineMotorbike, boats: ActionStartEngineBoat)
+$A action name=ActionSwitchLights          # headlights; horn: ActionVehicleHornShort / ActionVehicleHornLong hold=2
+$A drive_to x= z= speed=40                 # steers, holds speed, shifts a manual box, stops at the end
+$A drive throttle=0.5 steer=0.3 gear=2 secs=3   # raw controls (steer + = right; gear R/N/D/P/1..)
+$A stop_vehicle                            # brake to a standstill (a boat: throttle off, neutral, drift)
+$A action name=ActionStopEngine
+$A action name=ActionSwitchSeats seat=1    # seat= picks a seat component of the vehicle you're in
+$A leave                                   # hold F to get out; opens the door from inside first if shut
+$A action name=ActionOpenCarDoorsOutside target=<door id> component=0   # doors/hood/trunk from vehicle_parts
+$A vehicle                                 # speed, rpm, gear, controls, fluids, crew per seat, parts
+```
+
+- Doors, seats, engine, lights, horn, pushing, getting in and out are the game's own actions;
+  driving controls are fed to the vehicle in `OnInput`, as vanilla's debug autopilot does.
+- Rear seats need the front seat tipped (`ActionAnimateSeats` on it) and the door open, like a player.
+- Cars and boats drive. **Motorbikes (1.30) don't move under scripted throttle**: getting on, the
+  engine, lights and horn work, but the engine ignores script throttle (rider input only).
+- A boat can't be boarded while swimming: put it in shallow water (`vehicle_place`) and board from
+  wading depth. It won't shift into reverse while moving, so it stops by drifting.
+- Vehicles have physics: an unbraked car on a slope rolls when something wakes it. The north-west
+  airfield (about x 4040-4160, z 10400-10840) is flat concrete for driving tests.
+- There's no pathfinding: `move_to`/`enter`/`drive_to` go in straight lines (enter steers round the
+  vehicle it's entering) and give up after 8 s without progress.
+- Network ids change when the server restarts; refer to vehicles by type after a restart.
+- Get out before killing or respawning the player: dying in a vehicle and respawning crashed both
+  the 1.30 client and the server (engine bug).
+
 ## Commands
 
 Client: `status`, `wait state=`, `player`, `inventory [depth=]`, `nearby [radius= type= kind=]`,
-`target`, `actions [target= why=true]`, `action name= [target= hold=]`, `key name=UAAction [hold=]`,
+`target`, `actions [target= seat=|component= why=true]`, `action name= [target= seat=|component= hold=]`,
+`key name=UAAction [hold=|release=true]`, `keys`, `vehicle`, `vehicle_parts`, `drive`, `drive_to`,
+`stop_vehicle`, `enter` and `leave` (CLI),
 `look yaw=/x= z=/at=`, `move [dir= speed= secs=]`, `move_to x= z=`, `stance value=`,
 `take item=`, `hands item=|none`, `drop [item=]`, `respawn`, `chat text=`, `connect`, `disconnect`,
 `quit`, `hud show=`, `ui`, `click name=|text=`, `menu [close=true|open=]`, `screenshot [width= hud=false]`.
 
 Server: `players`, `sv_player`, `spawn type= [at=ground|hands|inventory] [count= full=true quantity=]`,
+`vehicle_service`, `vehicle_place`,
 `teleport x= z=`, `heal`, `god [on=]`, `kill [id=]`, `delete id=|type=`, `time hour=`,
 `weather preset=`, `exec code=|file=`.
 
@@ -80,6 +118,12 @@ Both: `ping`, `help [name=]`, `jobs`, `stop`. `$A help` prints every usage line 
 
 ## Gotchas
 
+- A tap (`action` on a click-type input) and a hold (hold-type input) are kept apart as in the game:
+  F tapped takes an item into the inventory, F held takes it to the hands. A held key is let go as soon
+  as the action ends, or the game would chain the next one (get in -> get out).
+- `exec` scripts must keep expressions short: one that fails with "Formula too complex" crashes the
+  whole server (an engine bug). Split long string concatenations over several `+=` lines. `out` and
+  `local` are reserved words.
 - `exec` only works on the server (and an offline game): the retail client refuses to compile script
   ("LoadScript can't be called on Retail Client"). `exec code=` takes statements (add `return "...";`
   to get a value back) or a full `string AB_Run()`; compile errors come back in `"log"`.

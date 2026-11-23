@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0 - 2026-11-24
+
+- Vehicles: `vehicle` (speed, rpm, gear, controls, fluids, crew per seat, parts), `vehicle_parts`
+  (per seat: where to stand, door id/component/state; every door, the hood and the trunk), `drive`
+  (raw throttle/brake/steering/handbrake/gear), `drive_to` (steers, holds a speed, shifts a manual
+  gearbox, stops), `stop_vehicle`, and on the server `vehicle_service` (repair, fill fluids) and
+  `vehicle_place` (move/unflip, crew aboard). The CLI's `enter` walks round to a seat's door, opens it
+  and gets in; `leave` gets out, opening the door from inside first if it's shut. Cars and boats drive; 1.30 motorbikes ignore scripted throttle.
+- `actions`/`action` take `seat=` and `component=` to target vehicle seats, doors and parts; `why=true`
+  checks the forced target.
+- Fixed: a simulated tap also triggered the hold action on the same key (tapping F on a car door pushed
+  the car; F on an item took it to the hands); a held key now lets go when its action ends instead of
+  chaining the next one (get in, get out...); timed holds (`hold=`) never let go, because the per-frame
+  hook had silently stopped running (`typename.Spawn()` objects are freed); headlights/horn/NVG weren't
+  listed; `move_to` circled points it couldn't settle on (it now side-steps the last 2 m and gives up
+  after 8 s without progress); searches by x/z ignored terrain height.
+- `action` keeps looking for its action for up to 3 s (`settle=`): right after an item goes to the
+  hands the game offers nothing for about a second.
+- New `keys` command (simulated presses held right now). The client is capped at 60 fps.
+
 ## 0.1.1 - 2026-11-23
 
 - The command-line tool now ships with the mod (`extras/autobot` in the Workshop download) and runs

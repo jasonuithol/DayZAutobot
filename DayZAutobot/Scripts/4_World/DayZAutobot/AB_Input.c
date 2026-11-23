@@ -80,13 +80,50 @@ class AB_Input
 		s_Frame++;
 		float now = GetGame().GetTickTime();
 		array<int> gone = new array<int>;
+		// (plain ifs: Enforce has mis-evaluated long &&/|| chains over fields)
 		foreach (int id, AB_Press p : s_Presses)
 		{
-			if (p.Done || (!p.Hold && p.ClickFrame >= 0 && p.ClickFrame < s_Frame) || (p.Hold && p.Until > 0 && now >= p.Until))
+			bool retire = false;
+			if (p.Done)
+				retire = true;
+			if (!p.Hold)
+			{
+				if (p.ClickFrame >= 0)
+				{
+					if (p.ClickFrame < s_Frame)
+						retire = true;
+				}
+			}
+			else if (p.Until > 0)
+			{
+				if (now >= p.Until)
+					retire = true;
+			}
+			if (retire)
 				gone.Insert(id);
 		}
 		foreach (int g : gone)
 			s_Presses.Remove(g);
+	}
+
+	// A key held for one action: let go of it the moment that action ends (from OnActionEnd), before
+	// the game reads the key again and chains the next action on it (get in -> get out -> ...).
+	static ActionBase s_HoldFor;
+	static int s_HoldKey = -1;
+
+	static void HoldFor(ActionBase action, int key)
+	{
+		s_HoldFor = action;
+		s_HoldKey = key;
+	}
+
+	static void OnActionEnded(ActionBase action)
+	{
+		if (action == null || action != s_HoldFor)
+			return;
+		ReleaseId(s_HoldKey);
+		s_HoldFor = null;
+		s_HoldKey = -1;
 	}
 
 	static AB_Press Find(UAInput inp)
@@ -118,18 +155,35 @@ modded class ActionInput
 		if (p.ClickFrame == AB_Input.s_Frame)
 			firstFrame = true;
 
+		// The same key drives a tap input (F: Interact) and a hold input (F held: ContinuousInteract).
+		// The game tells them apart by timing (LocalClick vs LocalHoldBegin), so a scripted tap must
+		// only reach tap inputs and a scripted hold only hold inputs, or a tap on a car door also
+		// starts pushing the car.
 		switch (m_InputType)
 		{
 			case ActionInputType.AIT_CONTINUOUS:
+				// active while held; a tap never reaches it
+				m_JustActivate = p.Hold && firstFrame && !m_Active;
+				m_Active = p.Hold;
+				break;
 			case ActionInputType.AIT_CLICKCONTINUOUS:
-				// held: active the whole time; a click is a one-frame hold
-				m_JustActivate = firstFrame && !m_Active;
-				m_Active = p.Hold || firstFrame;
+				// a tap starts it, the next tap stops it
+				m_JustActivate = false;
+				if (!p.Hold && firstFrame)
+				{
+					m_JustActivate = !m_Active;
+					m_Active = !m_Active;
+				}
+				break;
+			case ActionInputType.AIT_HOLDSINGLE:
+				// fires once when a hold begins
+				m_Active = p.Hold && firstFrame;
+				m_JustActivate = m_Active;
 				break;
 			default:
-				// single / hold-single / double click: fire once, on the first frame
-				m_Active = firstFrame;
-				m_JustActivate = firstFrame;
+				// single / double click: fires once on a tap
+				m_Active = !p.Hold && firstFrame;
+				m_JustActivate = m_Active;
 				break;
 		}
 	}
@@ -152,6 +206,13 @@ modded class ActionManagerClient
 		super.Update(pCurrentCommandID);
 	}
 
+	override void OnActionEnd()
+	{
+		if (m_CurrentActionData != null)
+			AB_Input.OnActionEnded(m_CurrentActionData.m_Action);
+		super.OnActionEnd();
+	}
+
 	override protected void FindContextualUserActions(int pCurrentCommandID)
 	{
 		m_AB_Finds++;
@@ -172,6 +233,15 @@ modded class ActionManagerClient
 	void AB_Why(AB_JArr outList)
 	{
 		ActionTarget t = FindActionTarget();
+		// a forced target (actions target=/seat=/component=) is what the inputs use: check that one
+		foreach (ActionInput fi : m_OrederedAllActionInput)
+		{
+			if (fi.m_ForcedTarget != null && fi.m_ForcedTarget.GetObject() != null)
+			{
+				t = fi.m_ForcedTarget;
+				break;
+			}
+		}
 		ItemBase item = FindActionItem();
 		int mask = ActionBase.ComputeConditionMask(m_Player, t, item);
 		array<Object> sources = new array<Object>;

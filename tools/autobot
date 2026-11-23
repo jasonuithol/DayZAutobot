@@ -24,6 +24,8 @@ Game commands (sent to the client; prefix with `server` to send to the test serv
   autobot help              lists every game command with usage
   autobot exec code='return GetGame().GetPlayer().GetType();'
   autobot screenshot [width=960] [hud=false]   -> PNG path (X11 grab of this instance's window)
+  autobot enter [target=<vehicle id|type>] [seat=0]   walk to the seat's door, open it, get in
+  autobot leave                                       get out (opening the door from inside if shut)
 
 Arguments are key=value. Options: --instance NAME (default: default), --game stable|exp,
 --raw (one-line JSON), --timeout SECS.
@@ -662,6 +664,7 @@ def launch(opts, attempt=1):
     mods = link_mods(client_dir, ["autobot"] + split_list(opts.get("mods")), lower=False)
     args = [f"-mod={';'.join(mods)}", f"-profiles={winpath(prof)}", f"-autobot={PORT}", f"-autobotInst={name}",
             "-window", "-noPause", "-noPauseAudio", "-nosplash", "-skipIntro", "-noBenchmark",
+            f"-limitFPS={opts.get('fps', 60)}",  # headless it would render hundreds of frames a second
             f"-name={opts.get('name', 'Autobot')}"]
     if opts.get("connect"):
         host, _, port = opts["connect"].partition(":")
@@ -1017,6 +1020,113 @@ def exec_cmd(target, prof, args):
         (d / name).unlink(missing_ok=True)
     return r
 
+def approach_path(me, center, entry, clearance=3.0):
+    """Waypoints (x, z) to walk from me to just outside a vehicle's door without walking into the
+    vehicle: straight there if the way is clear, else round the side of the vehicle nearest to me."""
+    import math
+    def sub(a, b): return (a[0] - b[0], a[1] - b[1])
+    def add(a, b): return (a[0] + b[0], a[1] + b[1])
+    def mul(a, k): return (a[0] * k, a[1] * k)
+    def norm(a):
+        l = math.hypot(a[0], a[1]) or 1.0
+        return (a[0] / l, a[1] / l)
+    def seg_dist(p, a, b):
+        ab, ap = sub(b, a), sub(p, a)
+        t = max(0.0, min(1.0, (ap[0] * ab[0] + ap[1] * ab[1]) / ((ab[0] ** 2 + ab[1] ** 2) or 1.0)))
+        q = add(a, mul(ab, t))
+        return math.hypot(p[0] - q[0], p[1] - q[1])
+    me, c, e = (me[0], me[2]), (center[0], center[2]), (entry[0], entry[2])
+    out = norm(sub(e, c))                      # from the vehicle's centre out through the door
+    stand = add(e, mul(out, 1.2))              # just outside the door
+    if seg_dist(c, me, stand) >= clearance:
+        return [stand]
+    perp = (-out[1], out[0])
+    side = perp if (sub(me, c)[0] * perp[0] + sub(me, c)[1] * perp[1]) > 0 else mul(perp, -1)
+    corner = add(c, mul(side, 4.5))            # beside the vehicle, on my side
+    corner2 = add(c, mul(norm(add(side, out)), 4.5))
+    path = [corner] if seg_dist(c, me, corner) < clearance else []
+    return path + [corner2, stand]
+
+
+def enter_vehicle(name, args):
+    """Gets into a vehicle seat the way a player does: walk to the seat's door, open it if it's
+    shut, get in (hold F). target= is a vehicle id or type (default: the nearest), seat= 0 = driver."""
+    target = args.get("target", "")
+    seat = int(args.get("seat", 0))
+    steps = []
+
+    def step(cmd, a):
+        r = send(name, cmd, a)
+        steps.append({"cmd": cmd, "ok": r.get("ok"), "error": r.get("error")})
+        return r
+
+    q = {"target": target} if target else {}
+    parts = step("vehicle_parts", dict(q, radius=args.get("radius", 30)))
+    if not parts.get("ok"):
+        return dict(parts, steps=steps)
+    veh = parts["result"]["id"]
+    seats = parts["result"]["seats"]
+    if seat >= len(seats):
+        return {"ok": False, "error": f"{parts['result']['type']} has {len(seats)} seats", "steps": steps}
+    info = seats[seat]
+    if info.get("occupant"):
+        return {"ok": False, "error": f"seat {seat} is taken", "steps": steps}
+    entry = info["entry"]
+    veh_info = send(name, "vehicle", {"target": veh})
+    me = send(name, "player", {})
+    if not veh_info.get("ok") or not me.get("ok"):
+        return {"ok": False, "error": "can't read the vehicle or the player", "steps": steps}
+    for wx, wz in approach_path(me["result"]["pos"], veh_info["result"]["pos"], entry):
+        r = step("move_to", {"x": wx, "z": wz, "radius": 1.0, "speed": 1})
+        if not r.get("ok"):
+            return dict(r, steps=steps)
+    r = step("move_to", {"x": entry[0], "z": entry[2], "radius": 0.5, "speed": 1})
+    # a boat's (or a bike's) seat sits inside the hull: you can't walk onto it, but it's in reach
+    if not r.get("ok") and r.get("result", {}).get("dist", 99) > 2.5:
+        return dict(r, steps=steps)
+    if info.get("door") == "DOORS_CLOSED" and info.get("door_id"):
+        r = step("action", {"name": "ActionOpenCarDoorsOutside", "target": info["door_id"],
+                            "component": info.get("door_entity_component", 0)})
+        if not r.get("ok"):
+            return dict(r, steps=steps)
+        time.sleep(1)
+    r = step("action", {"name": "ActionGetInTransport", "target": veh, "seat": seat})
+    if not r.get("ok"):
+        why = send(name, "actions", {"target": veh, "seat": seat, "why": "true"})
+        blocked = [w for w in why.get("result", {}).get("why", []) if w.get("action") == "ActionGetInTransport"]
+        return dict(r, steps=steps, why=blocked, seat_info=info)
+    for _ in range(20):
+        v = send(name, "vehicle", {})
+        if v.get("ok") and v["result"].get("my_seat") == seat:
+            return {"ok": True, "result": v["result"], "steps": steps}
+        time.sleep(0.5)
+    return {"ok": False, "error": "the get-in action ran but the player isn't in the seat", "steps": steps}
+
+
+def leave_vehicle(name, args):
+    """Gets out of the vehicle the way a player does: hold F; if the door is shut (only "Open" is
+    offered), open it from inside first."""
+    steps = []
+    acts = send(name, "actions", {})
+    offered = [a["action"] for a in acts.get("result", {}).get("actions", [])]
+    steps.append({"cmd": "actions", "offered": offered})
+    if "ActionGetOutTransport" not in offered and "ActionOpenCarDoors" in offered:
+        r = send(name, "action", {"name": "ActionOpenCarDoors"})
+        steps.append({"cmd": "action ActionOpenCarDoors", "ok": r.get("ok"), "error": r.get("error")})
+        if not r.get("ok"):
+            return dict(r, steps=steps)
+    r = send(name, "action", {"name": "ActionGetOutTransport"})
+    steps.append({"cmd": "action ActionGetOutTransport", "ok": r.get("ok"), "error": r.get("error")})
+    if not r.get("ok"):
+        return dict(r, steps=steps)
+    for _ in range(20):
+        v = send(name, "vehicle", {})
+        if not v.get("ok"):
+            return {"ok": True, "result": send(name, "player", {}).get("result"), "steps": steps}
+        time.sleep(0.5)
+    return {"ok": False, "error": "still in the vehicle", "steps": steps}
+
+
 def cycle(opts):
     """Rebuild the mod and restart the server and client with their last settings (they must load
     the same PBOs), then rejoin. Use after changing DayZAutobot or a mod under test."""
@@ -1153,7 +1263,11 @@ def main(argv):
     if opts.get("timeout"):
         args["timeout"] = opts["timeout"]
 
-    if cmd == "screenshot":
+    if cmd == "enter" and target != "server":
+        r = enter_vehicle(target, args)
+    elif cmd == "leave" and target != "server":
+        r = leave_vehicle(target, args)
+    elif cmd == "screenshot":
         r = screenshot(opts["instance"], args)
     elif cmd == "exec":
         r = exec_cmd(target, prof, args)

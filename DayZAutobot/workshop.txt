@@ -4,6 +4,7 @@ A test-automation mod for DayZ modders. Load it on a local test server and on a 
 [list]
 [*] Starts a throwaway local test server and an automated client, both with the mods you're testing.
 [*] Drives the player: move, turn, aim, change stance, walk to a point.
+[*] Drives vehicles: gets in through the right door, starts the engine, lights, horn, seats, and drives cars and boats to a point, with speed, gear and fluid readouts.
 [*] Uses the real action system: the same F / left mouse presses a player makes, so your mod's actions, conditions and client/server flow are tested for real.
 [*] Explains actions: lists what the game offers for any object, and for the ones it doesn't, which condition blocks them (too far, wrong item in hands, ruined...).
 [*] Observes: player state, inventory trees, nearby objects, menus and buttons, screenshots, script logs.
@@ -58,6 +59,7 @@ autobot server-stop                     # stop the server
 [*] Server: server heal, server god, server teleport x= z=, server time hour=12, server weather preset=clear, server kill, server players
 [*] Server script: server exec code='return GetGame().GetMission().ClassName();'
 [*] Menus: disconnect, connect, respawn, ui, click name=, hud show=false
+[*] Vehicles: autobot enter target=OffroadHatchback (walks to the door, opens it, gets in), action name=ActionStartEngine, action name=ActionSwitchLights, drive_to x= z= speed=40, drive throttle=0.5 steer=0.3 gear=2 secs=3, stop_vehicle, action name=ActionSwitchSeats seat=1, action name=ActionGetOutTransport, vehicle, vehicle_parts, server vehicle_service, server vehicle_place. Cars and boats drive; the 1.30 motorbikes can be mounted and started but don't respond to scripted throttle.
 [/list]
 
 [h2]Good to know[/h2]

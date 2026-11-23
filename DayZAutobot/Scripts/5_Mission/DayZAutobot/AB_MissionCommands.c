@@ -209,8 +209,12 @@ modded class InGameMenu
 
 class AB_MissionCommands : AB_Registrar
 {
+	// typename.Spawn()'s object is freed even while the core holds it in a ref; keep it alive here
+	static ref AB_MissionCommands s_Keep;
+
 	override void Register(AB_Registry reg)
 	{
+		s_Keep = this;
 	reg.Add("hud", AB_Cmd_Hud, "hud show=true|false - show or hide the HUD");
 	reg.Add("ui", AB_Cmd_Ui, "ui - the menu on top and its visible buttons (name, label)");
 	reg.Add("click", AB_Cmd_Click, "click name=<widget> | text=<label> - click a button on the menu on top");

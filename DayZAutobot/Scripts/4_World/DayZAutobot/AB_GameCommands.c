@@ -183,26 +183,34 @@ void AB_RegisterGameCommands(AB_Registry reg)
 // The World module's commands. Found by name by the core (3_Game AB_Core.c).
 class AB_WorldCommands : AB_Registrar
 {
+	// typename.Spawn()'s object is freed even while the core holds it in a ref; keep it alive here
+	static ref AB_WorldCommands s_Keep;
+
 	override void Register(AB_Registry reg)
 	{
+		s_Keep = this;
 		AB_RegisterGameCommands(reg);
 		AB_RegisterPlayerCommands(reg);
 		AB_RegisterServerCommands(reg);
+		AB_RegisterVehicleCommands(reg);
 	}
 
-	override void OnFrame(float dt)
+	override void AB_EachFrame(float dt)
 	{
 		if (!GetGame().IsDedicatedServer())
 			AB_Input.NextFrame();
 	}
 
-	override void OnStopAll()
+	override void AB_StopAll()
 	{
 		if (GetGame().IsDedicatedServer())
 			return;
 		AB_Input.ReleaseAll();
 		PlayerBase p = PlayerBase.Cast(GetGame().GetPlayer());
 		if (p)
+		{
 			p.AB_Release();
+			p.AB_ReleaseControls();
+		}
 	}
 }

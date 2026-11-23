@@ -7,7 +7,7 @@
 // then. Commands come from registrars in the World module (never reloaded) and the Mission module
 // (re-registered after each reload; a Mission command still running at a reload is failed).
 
-const string AB_VERSION = "0.1.1";
+const string AB_VERSION = "0.2.0";
 
 void AB_Log(string msg)
 {
@@ -151,12 +151,12 @@ class AB_Registrar : Managed
 	}
 
 	// every frame, before jobs run (client and server)
-	void OnFrame(float dt)
+	void AB_EachFrame(float dt)
 	{
 	}
 
 	// the stop command: release anything held (keys, movement)
-	void OnStopAll()
+	void AB_StopAll()
 	{
 	}
 }
@@ -164,7 +164,11 @@ class AB_Registrar : Managed
 class AB_Registry : Managed
 {
 	ref map<string, ref AB_CommandInfo> Commands = new map<string, ref AB_CommandInfo>;
-	ref array<ref AB_Registrar> Registrars = new array<ref AB_Registrar>;
+	// one registrar per module, in fields of their own: the World one lives as long as the game, the
+	// Mission one is replaced after every Mission-module reload (comparing typenames from an unloaded
+	// module is unreliable: it once dropped the World registrar with the stale Mission one)
+	ref AB_Registrar WorldReg;
+	ref AB_Registrar MissionReg;
 	protected bool m_Mission;
 
 	void Add(string name, typename t, string usage)
@@ -177,7 +181,10 @@ class AB_Registry : Managed
 		m_Mission = fromMission;
 		r.Register(this);
 		m_Mission = false;
-		Registrars.Insert(r);
+		if (fromMission)
+			MissionReg = r;
+		else
+			WorldReg = r;
 	}
 
 	// drop everything a (now stale) Mission module registered
@@ -399,12 +406,7 @@ class AB_Agent : Managed
 					}
 				}
 				Registry.ForgetMission();
-				for (int k = Registry.Registrars.Count() - 1; k >= 0; k--)
-				{
-					AB_Registrar old = Registry.Registrars[k];
-					if (old == null || old.Type() == m_MissionRegistrar)
-						Registry.Registrars.Remove(k);
-				}
+				Registry.MissionReg = null;
 			}
 			m_MissionRegistrar = mt;
 			Registry.AddRegistrar(AB_Registrar.Cast(mt.Spawn()), true);
@@ -462,15 +464,10 @@ class AB_Agent : Managed
 		Uptime += dt;
 		UpdateRegistrars();
 		EnsureRest();
-		// a registrar from an unloaded Mission module is freed under us: drop it
-		for (int ri = Registry.Registrars.Count() - 1; ri >= 0; ri--)
-		{
-			AB_Registrar r = Registry.Registrars[ri];
-			if (r == null)
-				Registry.Registrars.Remove(ri);
-			else
-				r.OnFrame(dt);
-		}
+		if (Registry.WorldReg != null)
+			Registry.WorldReg.AB_EachFrame(dt);
+		if (Registry.MissionReg != null)
+			Registry.MissionReg.AB_EachFrame(dt);
 
 		if (m_Running)
 		{
@@ -623,11 +620,10 @@ class AB_Agent : Managed
 			Finish(c);
 			n++;
 		}
-		foreach (AB_Registrar r2 : Registry.Registrars)
-		{
-			if (r2 != null)
-				r2.OnStopAll();
-		}
+		if (Registry.WorldReg != null)
+			Registry.WorldReg.AB_StopAll();
+		if (Registry.MissionReg != null)
+			Registry.MissionReg.AB_StopAll();
 		return n;
 	}
 
@@ -656,6 +652,9 @@ class AB_Cmd_Ping : AB_Command
 		AB_Agent a = AB_Agent.Get();
 		c.R.Str("version", AB_VERSION).Str("side", a.Side()).Str("instance", a.Instance);
 		c.R.Num("frame_ms", a.FrameTime * 1000).Num("uptime", a.Uptime);
+		c.R.Bool("world_registrar", a.Registry.WorldReg != null).Bool("mission_registrar", a.Registry.MissionReg != null);
+		if (a.Registry.WorldReg != null)
+			c.R.Str("world_registrar_class", a.Registry.WorldReg.ClassName());
 		return true;
 	}
 }
