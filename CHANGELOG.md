@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- CLI: `-h`/`--help` after a command prints the help instead of running the command (`cycle --help`
+  used to rebuild and restart everything), an unknown `--option` is an error instead of being
+  ignored, and local commands (`cycle`, `launch`, `server-start`...) reject stray `key=value` arguments.
+
 ## 0.2.0 - 2026-11-24
 
 - Vehicles: `vehicle` (speed, rpm, gear, controls, fluids, crew per seat, parts), `vehicle_parts`

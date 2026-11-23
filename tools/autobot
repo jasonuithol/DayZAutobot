@@ -1212,9 +1212,13 @@ def main(argv):
             opts[a.lstrip("-").replace("-", "_")] = True
             i += 1
             continue
-        if a in ("-h", "--help") and not rest:
+        if a in ("-h", "--help"):
             print(__doc__)
             return 0
+        # an unknown --option used to be passed on as a parameter, which local commands ignore:
+        # `cycle --help` rebuilt and restarted everything, a mistyped `--wip` didn't wipe
+        if a.startswith("--"):
+            die(f"unknown option {a} (options: {', '.join(sorted(VALUE_OPTS | FLAG_OPTS))})")
         rest.append(a)
         i += 1
     opts["extra"] = extra
@@ -1243,6 +1247,8 @@ def main(argv):
     if cmd == "log":
         return log_cmd(opts)
     if cmd in local:
+        if params:
+            die(f"{cmd} takes options (--name value), not {' '.join(params)}")
         r = local[cmd]()
         out(r, raw)
         return 0 if r.get("ok") else 1
