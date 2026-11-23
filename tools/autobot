@@ -1,0 +1,1080 @@
+#!/usr/bin/env python3
+"""autobot - drive an automated DayZ client (and a throwaway test server) for mod testing.
+
+Local commands:
+  setup                     build @DayZAutobot (tools/build) and prepare the client prefix
+  build                     pack DayZAutobot/ into build/@DayZAutobot
+  launch [--connect HOST[:PORT]] [--mods a,b] [--name N] [--window WxH] [--display virtual|desktop] [--no-wait]
+                            start the isolated client; waits for the main menu (or in game with --connect).
+                            By default it runs in a headless KWin (invisible, own Xwayland, real GPU);
+                            --display desktop shows the window (it grabs the mouse when focused)
+  kill                      kill the client (its Proton prefix only; your own game is never touched)
+  server-start [--mission DIR|TERRAIN] [--mods a,b] [--server-mods a,b] [--wipe] [--no-wait]
+                            deploy a throwaway mission and start the stable server (port 2402, no BattlEye)
+  server-stop               ask the server to exit, kill it if it doesn't
+  join                      connect the client to the throwaway server and wait until in game
+  cycle [--server]          rebuild, restart server + client with their last settings, rejoin
+  ps                        what's running (client, server, bridge) and what has polled the bridge
+  paths                     every location in use
+  log [-n N] [--grep RE] [--server]   newest script log of the client (or server)
+  bridge                    run the bridge in the foreground (normally started automatically)
+
+Game commands (sent to the client; prefix with `server` to send to the test server instead):
+  autobot status            autobot server status
+  autobot help              lists every game command with usage
+  autobot exec code='return GetGame().GetPlayer().GetType();'
+  autobot screenshot [width=960] [hud=false]   -> PNG path (X11 grab of this instance's window)
+
+Arguments are key=value. Options: --instance NAME (default: default), --game stable|exp,
+--raw (one-line JSON), --timeout SECS.
+"""
+import json, os, re, shutil, signal, socket, subprocess, sys, threading, time, uuid, hashlib, struct
+import urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+REPO = Path(__file__).resolve().parent.parent
+MOD_SRC = REPO / "DayZAutobot"
+BUILD = REPO / "build"
+HOME = Path(os.environ.get("AUTOBOT_HOME", Path.home() / ".local/share/DayZAutobot"))
+STEAM = Path(os.environ.get("STEAM", Path.home() / ".steam/debian-installation"))
+WORKSHOP = STEAM / "steamapps/workshop/content/221100"
+PORT = int(os.environ.get("AUTOBOT_PORT", "7879"))
+SERVER_PORT = int(os.environ.get("AUTOBOT_SERVER_PORT", "2402"))
+SERVER_QUERY_PORT = SERVER_PORT + 24714  # 27116 for 2402
+GAMES = {
+    "stable": ("DayZ", "DayZServer", 221100),
+    "exp": ("DayZ Exp", "DayZ Server Exp", 1024020),
+}
+MOD_LINK_DIR = "autobot-mods"
+
+# ------------------------------------------------------------------ helpers
+
+def out(obj, raw=False):
+    print(json.dumps(obj) if raw else json.dumps(obj, indent=2))
+
+
+def die(msg, code=1):
+    print(json.dumps({"ok": False, "error": msg}, indent=2))
+    sys.exit(code)
+
+
+def game_dirs(game):
+    client, server, appid = GAMES[game]
+    return STEAM / "steamapps/common" / client, STEAM / "steamapps/common" / server, appid
+
+
+def proton_dir():
+    name = os.environ.get("PROTON")
+    tools = STEAM / "compatibilitytools.d"
+    if not name:
+        found = sorted((p.name for p in tools.glob("*") if "proton" in p.name.lower()),
+                       key=lambda s: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", s)])
+        if not found:
+            die(f"no Proton build in {tools}")
+        name = found[-1]
+    return tools / name
+
+
+def winpath(p):
+    return "Z:" + str(p).replace("/", "\\")
+
+
+def inst_dir(name):
+    return HOME / "instances" / name
+
+
+def profiles_dir(name):
+    return inst_dir(name) / "profiles"
+
+
+def server_home():
+    return HOME / "server"
+
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:
+        return None
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:  # zombies count as dead
+        return Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def procs_with_env(pairs):
+    """PIDs whose environment has any of the key=value pairs (how we find our own Proton/Wine
+    processes; the game itself only carries WINEPREFIX, not STEAM_COMPAT_DATA_PATH)."""
+    needles = {f"{k}={v}".encode() for k, v in pairs}
+    pids = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) == os.getpid():
+            continue
+        try:
+            env = (d / "environ").read_bytes()
+        except OSError:
+            continue
+        if needles.intersection(env.split(b"\0")):
+            pids.append(int(d.name))
+    return pids
+
+
+def steam_running():
+    for d in Path("/proc").iterdir():
+        if d.name.isdigit():
+            try:
+                if (d / "comm").read_text().strip() == "steam":
+                    return True
+            except OSError:
+                pass
+    return False
+
+
+def port_open(port, host="127.0.0.1"):
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex((host, port)) == 0
+
+
+def udp_port_busy(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.bind(("0.0.0.0", port))
+            return False
+        except OSError:
+            return True
+
+# ------------------------------------------------------------------ bridge
+
+class Bridge:
+    """Queues commands per target (a client instance name, or "server"); the games long-poll."""
+
+    def __init__(self):
+        self.lock = threading.Condition()
+        self.queues = {}      # target -> [request]
+        self.results = {}     # id -> result
+        self.seen = {}        # target -> {time, side, version}
+
+    def poll(self, targets, info, wait):
+        deadline = time.time() + wait
+        with self.lock:
+            while True:
+                now = time.time()
+                for t in targets:
+                    self.seen[t] = dict(info, time=now)
+                for t in targets:
+                    q = self.queues.get(t)
+                    if q:
+                        return q.pop(0)
+                left = deadline - now
+                if left <= 0:
+                    return None
+                self.lock.wait(left)
+
+    def submit(self, target, req, timeout):
+        """Queue a request and wait for its result. Gives up when no game picks it up, or when the
+        game that took it stops polling (crashed, frozen, quit), rather than on a fixed deadline."""
+        with self.lock:
+            self.queues.setdefault(target, []).append(req)
+            self.lock.notify_all()
+            deadline = time.time() + timeout
+            queued_at = time.time()
+            while req["id"] not in self.results:
+                now = time.time()
+                s = self.seen.get(target)
+                silent = now - s["time"] if s else now - queued_at
+                q = self.queues.get(target, [])
+                waiting = req in q
+                if waiting and (silent > 15 and now - queued_at > 15):
+                    q.remove(req)
+                    return {"ok": False, "error": f"no game is polling for target '{target}'"
+                            f" (last seen: {self.age(target)})"}
+                if not waiting and silent > 40:
+                    return {"ok": False, "error": "the game took the command, then stopped polling "
+                            "(crashed, frozen, quit or loading?)"}
+                if now > deadline:
+                    if waiting:
+                        q.remove(req)
+                    return {"ok": False, "error": f"no answer within {timeout:.0f}s"}
+                self.lock.wait(1.0)
+            return self.results.pop(req["id"])
+
+    def age(self, target):
+        s = self.seen.get(target)
+        return "never" if not s else f"{time.time() - s['time']:.1f}s ago"
+
+    def result(self, res):
+        with self.lock:
+            self.results[res.get("id", "")] = res
+            self.lock.notify_all()
+
+
+def run_bridge(port):
+    bridge = Bridge()
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def reply(self, code, body):
+            data = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def body(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            return self.rfile.read(n).decode("utf-8", "replace") if n else ""
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            if u.path.startswith("/poll"):
+                targets = [t for t in q.get("targets", "default").split(",") if t]
+                info = {"side": q.get("side", ""), "version": q.get("version", "")}
+                req = bridge.poll(targets, info, min(float(q.get("wait", 4)), 8))
+                self.reply(200, json.dumps(req) if req else "{}")
+            elif u.path == "/seen":
+                now = time.time()
+                with bridge.lock:
+                    self.reply(200, json.dumps({t: dict(s, age=round(now - s["time"], 1))
+                                                for t, s in bridge.seen.items()}))
+            else:
+                self.reply(404, '{"ok":false}')
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            if u.path.startswith("/result"):
+                try:
+                    bridge.result(json.loads(self.body()))
+                except ValueError as e:
+                    print("bad result:", e, file=sys.stderr)
+                self.reply(200, "{}")
+            elif u.path == "/cmd":
+                msg = json.loads(self.body())
+                req = {"id": uuid.uuid4().hex[:12], "cmd": msg["cmd"], "args": msg.get("args", [])}
+                res = bridge.submit(msg.get("target", "default"), req, float(msg.get("timeout", 60)))
+                self.reply(200, json.dumps(res))
+            else:
+                self.reply(404, '{"ok":false}')
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    srv.daemon_threads = True
+    print(f"autobot bridge on 127.0.0.1:{port}", flush=True)
+    srv.serve_forever()
+
+
+def ensure_bridge():
+    if port_open(PORT):
+        return
+    HOME.mkdir(parents=True, exist_ok=True)
+    log = open(HOME / "bridge.log", "a")
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "bridge"], stdout=log, stderr=log,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(50):
+        if port_open(PORT):
+            return
+        time.sleep(0.1)
+    die("could not start the bridge (see %s)" % (HOME / "bridge.log"))
+
+
+def seen():
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/seen", timeout=3) as r:
+            return json.loads(r.read())
+    except Exception:
+        return {}
+
+
+def send(target, cmd, args=None, timeout=None):
+    """Run one game command; returns the game's reply dict."""
+    ensure_bridge()
+    flat = []
+    for k, v in (args or {}).items():
+        flat += [str(k), v if isinstance(v, str) else json.dumps(v)]
+    # the game enforces each command's own timeout; this is only a backstop
+    wait = timeout or (float(args["timeout"]) + 30 if (args or {}).get("timeout") else 3600)
+    body = json.dumps({"target": target, "cmd": cmd, "args": flat, "timeout": wait}).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/cmd", data=body, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=wait + 5) as r:
+            return json.loads(r.read())
+    except (urllib.error.URLError, socket.timeout) as e:
+        return {"ok": False, "error": f"bridge: {e}"}
+
+
+def compile_errors(prof, since):
+    """Script errors from a failed compile in the newest script log written after `since`
+    (None while the scripts still compile). Shows only the first lines: later ones cascade."""
+    log = newest_log(prof)
+    if not log or log.stat().st_mtime < since:
+        return None
+    text = log.read_text(errors="replace")
+    if "Can't compile" not in text:
+        return None
+    errs = [l.strip() for l in text.splitlines() if "(E)" in l or "Can't compile" in l]
+    return errs[:12]
+
+
+def wait_for_target(target, secs, state=None, prof=None, since=None, proc=None, crashed=None):
+    """Wait until a game polls for target (and, with state, reaches that state). Gives up early
+    when the game's scripts fail to compile or the process exits."""
+    deadline = time.time() + secs
+    while time.time() < deadline:
+        if prof is not None:
+            errs = compile_errors(prof, since)
+            if errs:
+                return {"ok": False, "error": "script compile failed", "log": errs}
+        if proc is not None and proc.poll() is not None:
+            return {"ok": False, "error": f"the game exited (code {proc.returncode})"}
+        if crashed is not None:
+            what = crashed()
+            if what:
+                return {"ok": False, "error": "the game crashed", "crashed": what}
+        s = seen().get(target)
+        if s and s["age"] < 6 and (since is None or time.time() - s["age"] > since):
+            if not state:
+                return send(target, "status", timeout=10)
+            r = send(target, "wait", {"state": state, "timeout": max(5, int(deadline - time.time()))})
+            return r
+        time.sleep(1)
+    return {"ok": False, "error": f"nothing polled the bridge as '{target}' within {secs}s"}
+
+# ------------------------------------------------------------------ build
+
+def pack_pbo(src, prefix, dest):
+    files = []
+    for root, dirs, names in os.walk(src):
+        dirs.sort()
+        for n in sorted(names):
+            full = Path(root) / n
+            files.append((str(full.relative_to(src)).replace("/", "\\"), full.read_bytes()))
+    entry = lambda fname, packing, size: fname.encode() + b"\0" + struct.pack("<IIIII", packing, size, 0, 0, size)
+    data = entry("", 0x56657273, 0) + b"prefix\0" + prefix.encode() + b"\0\0"
+    for fname, blob in files:
+        data += entry(fname, 0, len(blob))
+    data += entry("", 0, 0) + b"".join(b for _, b in files)
+    data += b"\0" + hashlib.sha1(data).digest()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return len(files)
+
+
+def build():
+    mod = BUILD / "@DayZAutobot"
+    n = pack_pbo(MOD_SRC, "DayZAutobot", mod / "addons" / "dayzautobot.pbo")
+    # sign with the tarbaby key when DayZMissions' signer and the key are available (optional:
+    # the throwaway server doesn't verify signatures)
+    signer = Path.home() / "Projects/DayZMissions/tools/sign_pbo.sh"
+    key = Path.home() / ".dayz-keys/tarbaby.biprivatekey"
+    signed = False
+    if signer.exists() and key.exists() and not os.environ.get("AUTOBOT_NO_SIGN"):
+        r = subprocess.run([str(signer), "tarbaby", str(mod / "addons/dayzautobot.pbo")],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            (mod / "keys").mkdir(exist_ok=True)
+            shutil.copy(key.with_suffix(".bikey"), mod / "keys")
+            signed = True
+    return {"ok": True, "built": str(mod), "files": n, "signed": signed}
+
+# ------------------------------------------------------------------ mods
+
+def resolve_mod(spec):
+    """A mod folder path, a Workshop id, or @Name of a subscribed Workshop mod."""
+    p = Path(spec).expanduser()
+    if p.is_dir():
+        return p.resolve()
+    if spec.isdigit() and (WORKSHOP / spec).is_dir():
+        return WORKSHOP / spec
+    if spec.startswith("@"):
+        for d in WORKSHOP.iterdir() if WORKSHOP.is_dir() else []:
+            meta = d / "meta.cpp"
+            if meta.exists() and re.search(r'name\s*=\s*"%s"' % re.escape(spec[1:]), meta.read_text(errors="replace")):
+                return d
+    die(f"mod not found: {spec} (give a folder, a Workshop id, or @Name of a subscribed mod)")
+
+
+def mod_name(path):
+    name = path.name
+    if name.isdigit():
+        meta = path / "meta.cpp"
+        m = re.search(r'name\s*=\s*"([^"]+)"', meta.read_text(errors="replace")) if meta.exists() else None
+        name = (m.group(1) if m else name).replace(" ", "-")
+    return name if name.startswith("@") else "@" + name
+
+
+def link_mods(game_dir, specs, lower):
+    """Links mods into game_dir/autobot-mods/@Name; returns the relative -mod= entries.
+    lower=True makes a folder of lower-cased symlinks (the Linux server only finds 'addons')."""
+    link_root = game_dir / MOD_LINK_DIR
+    link_root.mkdir(exist_ok=True)
+    entries = []
+    for spec in specs:
+        path = BUILD / "@DayZAutobot" if spec == "autobot" else resolve_mod(spec)
+        name = mod_name(path)
+        dest = link_root / name
+        if dest.is_symlink() or dest.is_file():
+            dest.unlink()
+        elif dest.is_dir():
+            shutil.rmtree(dest)
+        if lower:
+            dest.mkdir()
+            for e in path.iterdir():
+                (dest / e.name.lower()).symlink_to(e)
+        else:
+            dest.symlink_to(path)
+        entries.append(f"{MOD_LINK_DIR}/{name}")
+    return entries
+
+
+def split_list(v):
+    return [x for x in (v or "").split(",") if x]
+
+# ------------------------------------------------------------------ client
+
+def seed_settings(prof, window):
+    """The game's video settings. With -profiles it keeps them in <profiles>/Users/<Windows user>/DayZ.cfg
+    (not Documents). The window must fit the headless display, or the game fails to start."""
+    w, h = window.lower().split("x")
+    cfg = prof / "Users" / "steamuser" / "DayZ.cfg"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    # written fresh every launch: a file the game saved on exit (desktop-sized window, VSync...) has
+    # made the next headless start die with "Out of memory"
+    want = {"language": '"English"', "Windowed": "1", "WindowWidth": w, "WindowHeight": h, "WinX": "0",
+            "WinY": "0", "VSync": "0", "Resolution_Bpp": "32"}
+    cfg.write_text("".join(f"{k}={v};\n" for k, v in want.items()))
+
+
+def start_display(idir, name, window):
+    """A headless KWin compositor (own Xwayland, own D-Bus session) for the game: a real 60 Hz output
+    on the real GPU, but nothing shows on your desktop and it can't grab your mouse. Screenshots
+    come from this compositor (Spectacle on its D-Bus). Returns (env dict, pid)."""
+    w, h = window.lower().split("x")
+    session = idir / "session.sh"
+    envfile = idir / "display.env"
+    envfile.unlink(missing_ok=True)
+    session.write_text('#!/bin/sh\nenv | grep -E "^(DISPLAY|WAYLAND_DISPLAY|DBUS_SESSION_BUS_ADDRESS)=" > "%s.tmp"\n'
+                       'mv "%s.tmp" "%s"\nexec sleep infinity\n' % (envfile, envfile, envfile))
+    session.chmod(0o755)
+    log = open(idir / "kwin.log", "w")
+    env = {k: v for k, v in os.environ.items() if k not in ("WAYLAND_DISPLAY", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS")}
+    p = subprocess.Popen(["dbus-run-session", "--", "kwin_wayland", "--virtual", "--xwayland", "--width", w,
+                          "--height", h, "--socket", f"autobot-{name}-{os.getpid()}", "--exit-with-session", str(session)],
+                         stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+                         start_new_session=True)
+    for _ in range(100):
+        if envfile.exists():
+            return dict(l.split("=", 1) for l in envfile.read_text().splitlines() if "=" in l), p.pid
+        if p.poll() is not None:
+            break
+        time.sleep(0.1)
+    die("the headless display didn't start (see %s)" % (idir / "kwin.log"))
+
+
+# ------------------------------------------------------------------ Steam Cloud isolation
+# The game writes its profile (main-menu character records per server, recent servers, seen items)
+# through the Steam Cloud API under YOUR account, into userdata/<id>/<appid>/remote. The bot runs as
+# you, so before it starts we snapshot that folder and put it back once the client has exited.
+
+def cloud_dirs(appid):
+    return [d for d in (STEAM / "userdata").glob(f"*/{appid}") if d.is_dir()]
+
+
+def cloud_snapshot_dir(appid):
+    return HOME / "cloud-snapshot" / str(appid)
+
+
+def snapshot_cloud(appid):
+    snap = cloud_snapshot_dir(appid)
+    if snap.exists():
+        return  # an earlier run's snapshot is still pending: keep the older, untouched one
+    for d in cloud_dirs(appid):
+        dest = snap / d.parent.name
+        dest.mkdir(parents=True, exist_ok=True)
+        if (d / "remote").is_dir():
+            shutil.copytree(d / "remote", dest / "remote")
+        if (d / "remotecache.vdf").exists():
+            shutil.copy2(d / "remotecache.vdf", dest / "remotecache.vdf")
+    snap.mkdir(parents=True, exist_ok=True)
+
+
+def restore_cloud():
+    """Puts DayZ's cloud files back as they were before the bot ran (only when no bot client runs)."""
+    root = HOME / "cloud-snapshot"
+    if not root.exists() or any(client_pids(p.name) for p in (HOME / "instances").glob("*")):
+        return False
+    for snap in root.iterdir():
+        for user in snap.iterdir():
+            d = STEAM / "userdata" / user.name / snap.name
+            if (user / "remote").is_dir():
+                if (d / "remote").exists():
+                    shutil.rmtree(d / "remote")
+                shutil.copytree(user / "remote", d / "remote")
+            if (user / "remotecache.vdf").exists():
+                shutil.copy2(user / "remotecache.vdf", d / "remotecache.vdf")
+    shutil.rmtree(root)
+    # the game also keeps local copies of those files; out of step with the cloud ones, they have
+    # crashed the next start, so let it fetch them again
+    for f in (HOME / "instances").glob("*/profiles/Users/*/*.DayZProfile"):
+        if f.name in ("chars.DayZProfile", "profile.vars.DayZProfile"):
+            f.unlink()
+    return True
+
+
+def client_pids(name):
+    prefix = inst_dir(name) / "prefix"
+    return procs_with_env([("STEAM_COMPAT_DATA_PATH", str(prefix)), ("WINEPREFIX", f"{prefix}/pfx"),
+                           ("WINEPREFIX", f"{prefix}/pfx/")])
+
+
+def startup_crashed(prof, since):
+    """The engine's crash/error dumps written since the launch (an error dialog leaves the process up)."""
+    for pat in ("ErrorMessage_*.mdmp", "crash_*.log", "*.mdmp"):
+        for f in Path(prof).glob(pat):
+            if f.stat().st_mtime >= since:
+                return f.name
+    return None
+
+
+def launch(opts, attempt=1):
+    name = opts["instance"]
+    client_dir, _, appid = game_dirs(opts["game"])
+    exe = client_dir / "DayZ_x64.exe"
+    if client_pids(name):
+        die(f"instance '{name}' is already running (autobot kill first)")
+    if not steam_running():
+        die("Steam isn't running - start it and log in first")
+    if not exe.exists():
+        die(f"not found: {exe}")
+    snapshot_cloud(appid)
+    if not (BUILD / "@DayZAutobot/addons/dayzautobot.pbo").exists():
+        build()
+    proton = proton_dir()
+    idir = inst_dir(name)
+    prefix = idir / "prefix"
+    prof = profiles_dir(name)
+    prof.mkdir(parents=True, exist_ok=True)
+    prefix.mkdir(parents=True, exist_ok=True)
+    seed_settings(prof, opts.get("window", "1280x720"))
+    ensure_bridge()
+
+    mods = link_mods(client_dir, ["autobot"] + split_list(opts.get("mods")), lower=False)
+    args = [f"-mod={';'.join(mods)}", f"-profiles={winpath(prof)}", f"-autobot={PORT}", f"-autobotInst={name}",
+            "-window", "-noPause", "-noPauseAudio", "-nosplash", "-skipIntro", "-noBenchmark",
+            f"-name={opts.get('name', 'Autobot')}"]
+    if opts.get("connect"):
+        host, _, port = opts["connect"].partition(":")
+        args += [f"-connect={host}", f"-port={port or SERVER_PORT}"]
+        if opts.get("password"):
+            args.append(f"-password={opts['password']}")
+    args += opts.get("extra", [])
+
+    env = dict(os.environ)
+    display_pid, denv = None, None
+    if opts.get("display", "virtual") == "virtual":
+        # (Xvfb doesn't work: it reports a 0 Hz refresh rate and the game divides by it)
+        denv, display_pid = start_display(idir, name, opts.get("window", "1280x720"))
+        env.pop("WAYLAND_DISPLAY", None)
+        env.update(DISPLAY=denv["DISPLAY"], PROTON_ENABLE_WAYLAND="0")
+        if os.environ.get("AUTOBOT_GPU"):
+            env["DXVK_FILTER_DEVICE_NAME"] = os.environ["AUTOBOT_GPU"]
+    env.update(STEAM_COMPAT_CLIENT_INSTALL_PATH=str(STEAM), STEAM_COMPAT_DATA_PATH=str(prefix),
+               STEAM_COMPAT_INSTALL_PATH=str(client_dir), STEAM_COMPAT_APP_ID=str(appid),
+               SteamAppId=str(appid), SteamGameId=str(appid),
+               PROTON_BATTLEYE_RUNTIME=str(STEAM / "steamapps/common/Proton BattlEye Runtime"))
+    log = open(idir / "proton.log", "w")
+    launched = time.time()
+    p = subprocess.Popen([str(proton / "proton"), "waitforexitandrun", str(exe)] + args, cwd=client_dir,
+                         env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+    keep = {k: opts[k] for k in ("mods", "name", "window", "password", "display") if opts.get(k)}
+    (idir / "run.json").write_text(json.dumps({"pid": p.pid, "game": opts["game"], "args": args, "opts": keep,
+                                               "display_pid": display_pid, "display": env.get("DISPLAY"),
+                                               "display_env": denv if display_pid else None,
+                                               "proton": proton.name, "started": time.time()}))
+    if opts.get("no_wait"):
+        return {"ok": True, "pid": p.pid, "args": args}
+    first = not (prefix / "pfx").exists() or not (prefix / "version").exists()
+    state = "ingame,dead" if opts.get("connect") else "main_menu"
+    r = wait_for_target(name, int(opts.get("wait_secs", 300 if first else 180)), state, prof=prof,
+                        since=launched, crashed=lambda: startup_crashed(prof, launched))
+    r["pid"] = p.pid
+    if r.get("crashed"):
+        # DayZ under Proton now and then dies at startup ("Out of memory (requested 0 KB)"), before
+        # any script runs; a plain relaunch gets past it
+        kill(name)
+        if attempt < 3:
+            r2 = launch(dict(opts), attempt + 1)
+            r2.setdefault("retried_after", []).insert(0, r["crashed"])
+            return r2
+        r["error"] = f"the client crashed at startup {attempt} times ({r['crashed']}); see {prof}"
+    elif not r.get("ok") and p.poll() is not None:
+        r["error"] = f"the client exited (code {p.returncode}); see {idir / 'proton.log'} and autobot log"
+    return r
+
+
+def kill(name):
+    pids = client_pids(name)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    stop_display(name)
+    for _ in range(20):
+        if not client_pids(name):
+            break
+        time.sleep(0.25)
+    return {"ok": True, "killed": len(pids), "cloud_restored": restore_cloud()}
+
+
+def stop_display(name):
+    run = read_json(inst_dir(name) / "run.json") or {}
+    pid = run.get("display_pid")
+    if pid and pid_alive(pid):
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() in ("dbus-run-sessio", "dbus-run-session", "kwin_wayland"):
+                    os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            return
+        # wait for it to let go of its Wayland socket lock, or the next launch can't take it
+        for _ in range(40):
+            if not pid_alive(pid):
+                return
+            time.sleep(0.1)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+# ------------------------------------------------------------------ server
+
+def deploy_mission(server_dir, mission, wipe):
+    """Builds mpmissions/autobot.<terrain>: the vanilla offline mission's files symlinked, with
+    a mission folder's own files (if given) copied over them. Persistence survives unless wipe."""
+    src = None
+    if mission and Path(mission).expanduser().is_dir():
+        src = Path(mission).expanduser().resolve()
+        terrain = src.name.split(".")[-1]
+    else:
+        terrain = mission or "chernarusplus"
+    vanilla = server_dir / "mpmissions" / f"dayzOffline.{terrain}"
+    if not vanilla.is_dir():
+        die(f"no vanilla mission {vanilla}")
+    target = server_dir / "mpmissions" / f"autobot.{terrain}"
+    keep = None
+    stores = list(target.glob("storage_*")) if target.exists() else []
+    if stores and not wipe:
+        keep = server_dir / "mpmissions" / f".autobot-keep-{os.getpid()}"
+        keep.mkdir()
+        for s in stores:
+            s.rename(keep / s.name)
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir()
+    if keep:
+        for s in keep.iterdir():
+            s.rename(target / s.name)
+        keep.rmdir()
+    for f in vanilla.iterdir():
+        if not f.name.startswith("storage_"):
+            (target / f.name).symlink_to(f)
+    if src:
+        for f in src.iterdir():
+            if f.name in ("mods.txt", "mission.conf"):
+                continue
+            dest = target / f.name
+            if f.is_dir() and (vanilla / f.name).is_dir():
+                dest.unlink()
+                dest.mkdir()
+                for v in (vanilla / f.name).iterdir():
+                    (dest / v.name).symlink_to(v)
+                for m in f.iterdir():
+                    d = dest / m.name
+                    if d.is_symlink() or d.is_file():
+                        d.unlink()
+                    shutil.copytree(m, d) if m.is_dir() else shutil.copy(m, d)
+            else:
+                if dest.is_symlink() or dest.is_file():
+                    dest.unlink()
+                shutil.copytree(f, dest) if f.is_dir() else shutil.copy(f, dest)
+    return target
+
+
+def server_pid():
+    run = read_json(server_home() / "run.json") or {}
+    pid = run.get("pid")
+    return pid if pid_alive(pid) else None
+
+
+def server_start(opts):
+    if server_pid():
+        die("the autobot server is already running (autobot server-stop first)")
+    if udp_port_busy(SERVER_PORT):
+        die(f"UDP port {SERVER_PORT} is in use")
+    _, server_dir, _ = game_dirs(opts["game"])
+    exe = server_dir / "DayZServer"
+    if not exe.exists():
+        die(f"not found: {exe}")
+    if not (BUILD / "@DayZAutobot/addons/dayzautobot.pbo").exists():
+        build()
+    ensure_bridge()
+    home = server_home()
+    prof = home / "profiles"
+    prof.mkdir(parents=True, exist_ok=True)
+    target = deploy_mission(server_dir, opts.get("mission"), opts.get("wipe"))
+
+    cfg_text = (server_dir / "serverDZ.cfg").read_text()
+    subs = {"hostname": '"Autobot test server"', "password": '""', "verifySignatures": "0",
+            "maxPlayers": "4", "serverTime": '"2026/6/1/10/0"', "serverTimeAcceleration": "1",
+            "serverTimePersistent": "0",
+            # its own shard: the client keys its main-menu character records by shardId, and the
+            # default 123abc would overwrite the record of any other default server you play on
+            "shardId": '"abtest"'}
+    for k, v in subs.items():
+        cfg_text = re.sub(rf"^{k}\s*=\s*[^;]*;", f"{k} = {v};", cfg_text, flags=re.M)
+    cfg_text = re.sub(r'template\s*=\s*"[^"]*"', f'template="{target.name}"', cfg_text)
+    cfg_text += f"\nBattlEye = 0;\nsteamQueryPort = {SERVER_QUERY_PORT};\n"
+    cfg = server_dir / "serverDZ.autobot.cfg"
+    cfg.write_text(cfg_text)
+
+    mods = link_mods(server_dir, ["autobot"] + split_list(opts.get("mods")), lower=True)
+    smods = link_mods(server_dir, split_list(opts.get("server_mods")), lower=True) if opts.get("server_mods") else []
+    args = [f"-config={cfg.name}", f"-port={SERVER_PORT}", f"-profiles={prof}", f"-mission=./mpmissions/{target.name}",
+            f"-mod={';'.join(mods)}", f"-autobot={PORT}", "-dologs", "-adminlog", "-freezecheck"]
+    if smods:
+        args.append(f"-serverMod={';'.join(smods)}")
+    args += opts.get("extra", [])
+    log = open(home / "stdout.log", "w")
+    p = subprocess.Popen(["./DayZServer"] + args, cwd=server_dir, stdout=log, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    keep = {k: opts[k] for k in ("mission", "mods", "server_mods") if opts.get(k)}
+    (home / "run.json").write_text(json.dumps({"pid": p.pid, "game": opts["game"], "args": args, "opts": keep,
+                                               "mission": str(target), "started": time.time()}))
+    if opts.get("no_wait"):
+        return {"ok": True, "pid": p.pid}
+    deadline = time.time() + int(opts.get("wait_secs", 240))
+    started = time.time() - 2
+    while time.time() < deadline:
+        if p.poll() is not None:
+            return {"ok": False, "error": f"server exited (code {p.returncode}); autobot log --server"}
+        errs = compile_errors(prof, started)
+        if errs:
+            os.killpg(p.pid, signal.SIGKILL)
+            return {"ok": False, "error": "server scripts failed to compile (server killed)", "log": errs}
+        s = seen().get("server")
+        if s and s["age"] < 6:
+            r = send("server", "status", timeout=10)
+            if r.get("ok") and r.get("result", {}).get("mission"):
+                r["pid"] = p.pid
+                r["address"] = f"127.0.0.1:{SERVER_PORT}"
+                return r
+        time.sleep(2)
+    return {"ok": False, "error": "server didn't come up in time", "pid": p.pid}
+
+
+def server_stop():
+    pid = server_pid()
+    if not pid:
+        return {"ok": True, "running": False}
+    send("server", "quit", timeout=5)
+    for _ in range(60):
+        if not pid_alive(pid):
+            return {"ok": True, "stopped": "clean"}
+        time.sleep(0.5)
+    os.killpg(pid, signal.SIGKILL) if pid_alive(pid) else None
+    return {"ok": True, "stopped": "killed"}
+
+# ------------------------------------------------------------------ logs, screenshots, exec
+
+def newest_log(prof, pattern="script*.log"):
+    logs = sorted(Path(prof).glob(pattern), key=lambda p: p.stat().st_mtime)
+    return logs[-1] if logs else None
+
+
+def log_cmd(opts):
+    prof = server_home() / "profiles" if opts.get("server") else profiles_dir(opts["instance"])
+    f = newest_log(prof)
+    if not f:
+        die(f"no script log in {prof}")
+    lines = f.read_text(errors="replace").splitlines()
+    if opts.get("grep"):
+        rx = re.compile(opts["grep"])
+        lines = [l for l in lines if rx.search(l)]
+    n = int(opts.get("n", 40))
+    print(f"== {f}")
+    print("\n".join(lines[-n:]))
+    return 0
+
+
+def game_to_host(game_path, prof):
+    if game_path.startswith("$profile:"):
+        return Path(prof) / game_path[len("$profile:"):].replace("\\", "/")
+    return Path(game_path)
+
+
+def proc_env(pid, key):
+    try:
+        for kv in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+            if kv.startswith(key.encode() + b"="):
+                return kv.split(b"=", 1)[1].decode()
+    except OSError:
+        pass
+    return None
+
+
+def client_window(name):
+    """The X11 (XWayland) window of this instance's DayZ, matched by _NET_WM_PID to our Proton
+    prefix's processes, so a game you run yourself is never captured. Returns (id, display)."""
+    pids = set(client_pids(name))
+    if not pids:
+        return None, None
+    display = next((d for d in (proc_env(p, "DISPLAY") for p in pids) if d), os.environ.get("DISPLAY", ":0"))
+    env = dict(os.environ, DISPLAY=display)
+    tree = subprocess.run(["xwininfo", "-root", "-tree"], capture_output=True, text=True, env=env).stdout
+    best = None
+    for line in tree.splitlines():
+        m = re.match(r"\s*(0x[0-9a-f]+) .*\(\"steam_app_\d+\".*\)\s+(\d+)x(\d+)", line)
+        if not m:
+            continue
+        wid, w, h = m.group(1), int(m.group(2)), int(m.group(3))
+        prop = subprocess.run(["xprop", "-id", wid, "_NET_WM_PID"], capture_output=True, text=True, env=env).stdout
+        pm = re.search(r"= (\d+)", prop)
+        if not pm or int(pm.group(1)) not in pids:
+            continue
+        info = subprocess.run(["xwininfo", "-id", wid], capture_output=True, text=True, env=env).stdout
+        if "IsViewable" not in info:
+            continue
+        if not best or w * h > best[1]:
+            best = (wid, w * h)
+    return (best[0] if best else None), display
+
+
+def screenshot(name, args):
+    width = args.pop("width", None)
+    hud = str(args.pop("hud", "true")).lower() not in ("false", "0", "no")
+    if not client_pids(name):
+        return {"ok": False, "error": "the client isn't running"}
+    run = read_json(inst_dir(name) / "run.json") or {}
+    denv = run.get("display_env")
+    shots = inst_dir(name) / "shots"
+    shots.mkdir(parents=True, exist_ok=True)
+    png = shots / (args.pop("name", time.strftime("%Y%m%d-%H%M%S")) + ".png")
+    if denv:
+        # headless: grab the nested compositor's output (Xwayland can't read GPU-presented frames)
+        cenv = dict({k: v for k, v in os.environ.items() if k != "DISPLAY"}, **denv, QT_QPA_PLATFORM="wayland")
+        grab = ["spectacle", "-b", "-n", "-a", "-e", "-o", str(png)]  # the game window, no title bar
+    else:
+        wid, display = client_window(name)
+        if not wid:
+            return {"ok": False, "error": "no DayZ window for this instance"}
+        cenv = dict(os.environ, DISPLAY=display)
+        grab = ["import", "-silent", "-window", wid, str(png)]
+    hid = False
+    if not hud:
+        hid = send(name, "hud", {"show": "false"}, timeout=10).get("ok", False)
+        time.sleep(0.25)
+    png.unlink(missing_ok=True)
+    try:
+        c = subprocess.run(grab, capture_output=True, text=True, env=cenv, timeout=30)
+    except subprocess.TimeoutExpired:
+        c = subprocess.CompletedProcess(grab, 1, "", "timed out")
+    if c.returncode == 0 and png.exists() and width:
+        subprocess.run(["convert", str(png), "-resize", f"{width}x", str(png)])
+    if hid:
+        send(name, "hud", {"show": "true"}, timeout=10)
+    if c.returncode != 0 or not png.exists():
+        return {"ok": False, "error": "capture failed: " + c.stderr.strip()}
+    return {"ok": True, "result": {"path": str(png)}}
+
+
+def exec_cmd(target, prof, args):
+    code = args.pop("code", None)
+    local = args.pop("file", None)
+    if local:
+        src = Path(local).read_text()
+    elif code is not None:
+        src = code if "AB_Run" in code else "string AB_Run()\n{\n" + code + ("\n" if "return" in code else "\nreturn \"\";\n") + "}\n"
+    else:
+        return {"ok": False, "error": "exec needs code= or file="}
+    d = Path(prof) / "autobot/exec"
+    d.mkdir(parents=True, exist_ok=True)
+    name = "x" + uuid.uuid4().hex[:8] + ".c"
+    (d / name).write_text(src)
+    log = newest_log(prof)
+    start = log.stat().st_size if log else 0
+    r = send(target, "exec", dict(args, file=f"$profile:autobot/exec/{name}"))
+    if not r.get("ok"):
+        log = newest_log(prof)
+        if log:
+            with open(log, errors="replace") as fh:
+                fh.seek(start if log.stat().st_size >= start else 0)
+                errs = [l.strip() for l in fh if "error" in l.lower() or "can't compile" in l.lower()]
+            if errs:
+                r["log"] = errs[-10:]
+    else:
+        (d / name).unlink(missing_ok=True)
+    return r
+
+def cycle(opts):
+    """Rebuild the mod and restart the server and client with their last settings (they must load
+    the same PBOs), then rejoin. Use after changing DayZAutobot or a mod under test."""
+    name = opts["instance"]
+    srun = read_json(server_home() / "run.json") or {}
+    crun = read_json(inst_dir(name) / "run.json") or {}
+    had_server, had_client = bool(server_pid()), bool(client_pids(name))
+    steps = {}
+    if had_client:
+        send(name, "quit", timeout=5)
+        for _ in range(20):
+            if not client_pids(name):
+                break
+            time.sleep(0.5)
+        kill(name)
+    if had_server:
+        steps["server_stop"] = server_stop()
+    steps["build"] = build()
+    if had_server or opts.get("server"):
+        sopts = dict(srun.get("opts", {}), **{k: v for k, v in opts.items() if k in ("mission", "mods", "server_mods", "wipe")})
+        sopts.setdefault("game", opts["game"])
+        sopts.setdefault("extra", [])
+        steps["server"] = r = server_start(sopts)
+        if not r.get("ok"):
+            return dict(ok=False, error="server didn't start", steps=steps)
+    copts = dict(crun.get("opts", {}), instance=name, game=opts["game"], extra=[])
+    if opts.get("mods"):
+        copts["mods"] = opts["mods"]
+    copts.pop("connect", None)
+    r = launch(copts)
+    steps["client"] = r
+    if not r.get("ok"):
+        return dict(ok=False, error="client didn't start", steps=steps)
+    if had_server or opts.get("server"):
+        r = send(name, "connect", {"address": "127.0.0.1", "port": SERVER_PORT, "timeout": 240}, timeout=260)
+        return dict(r, steps={k: v.get("ok") for k, v in steps.items()})
+    return dict(r, steps={k: v.get("ok") for k, v in steps.items()})
+
+
+# ------------------------------------------------------------------ ps / paths
+
+def ps(opts):
+    name = opts["instance"]
+    run = read_json(inst_dir(name) / "run.json") or {}
+    srun = read_json(server_home() / "run.json") or {}
+    return {"ok": True, "bridge": port_open(PORT), "client": {"running": bool(client_pids(name)), "pid": run.get("pid")},
+            "server": {"running": bool(server_pid()), "pid": srun.get("pid"), "mission": srun.get("mission")},
+            "polling": seen()}
+
+
+def paths(opts):
+    client_dir, server_dir, _ = game_dirs(opts["game"])
+    name = opts["instance"]
+    return {"ok": True, "repo": str(REPO), "home": str(HOME), "client_dir": str(client_dir), "server_dir": str(server_dir),
+            "proton": str(proton_dir()), "prefix": str(inst_dir(name) / "prefix"),
+            "profiles": str(profiles_dir(name)), "server_profiles": str(server_home() / "profiles"),
+            "mod_build": str(BUILD / "@DayZAutobot"), "bridge_port": PORT,
+            "server_address": f"127.0.0.1:{SERVER_PORT}", "script_log": str(newest_log(profiles_dir(name)) or "")}
+
+# ------------------------------------------------------------------ main
+
+VALUE_OPTS = {"--display", "--instance", "--game", "--connect", "--mods", "--server-mods", "--mission", "--name", "--window",
+              "--timeout", "-n", "--grep", "--password", "--wait-secs"}
+FLAG_OPTS = {"--no-wait", "--raw", "--wipe", "--server"}
+
+
+def main(argv):
+    opts = {"instance": "default", "game": "stable"}
+    rest, extra = [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            extra = argv[i + 1:]
+            break
+        if a in VALUE_OPTS and i + 1 < len(argv):
+            opts[a.lstrip("-").replace("-", "_")] = argv[i + 1]
+            i += 2
+            continue
+        if a in FLAG_OPTS:
+            opts[a.lstrip("-").replace("-", "_")] = True
+            i += 1
+            continue
+        if a in ("-h", "--help") and not rest:
+            print(__doc__)
+            return 0
+        rest.append(a)
+        i += 1
+    opts["extra"] = extra
+    if not rest:
+        print(__doc__)
+        return 0
+    raw = opts.get("raw")
+    cmd, params = rest[0], rest[1:]
+
+    local = {
+        "build": lambda: build(),
+        "setup": lambda: build(),
+        "launch": lambda: launch(opts),
+        "kill": lambda: kill(opts["instance"]),
+        "server-start": lambda: server_start(opts),
+        "server-stop": lambda: server_stop(),
+        "ps": lambda: ps(opts),
+        "paths": lambda: paths(opts),
+        "cycle": lambda: cycle(opts),
+        "join": lambda: send(opts["instance"], "connect", {"address": "127.0.0.1", "port": SERVER_PORT, "timeout": 240}),
+    }
+    if cmd == "bridge":
+        run_bridge(PORT)
+        return 0
+    restore_cloud()  # if a bot client has exited since it was launched
+    if cmd == "log":
+        return log_cmd(opts)
+    if cmd in local:
+        r = local[cmd]()
+        out(r, raw)
+        return 0 if r.get("ok") else 1
+
+    target, prof = opts["instance"], profiles_dir(opts["instance"])
+    if cmd == "server":
+        if not params:
+            die("usage: autobot server <command> [key=value ...]")
+        target, prof = "server", server_home() / "profiles"
+        cmd, params = params[0], params[1:]
+        # an offline client also answers for "server"
+    args = {}
+    for p in params:
+        if "=" not in p:
+            die(f"argument '{p}' must be key=value")
+        k, v = p.split("=", 1)
+        args[k] = v
+    if opts.get("timeout"):
+        args["timeout"] = opts["timeout"]
+
+    if cmd == "screenshot":
+        r = screenshot(opts["instance"], args)
+    elif cmd == "exec":
+        r = exec_cmd(target, prof, args)
+    else:
+        r = send(target, cmd, args)
+    out(r, raw)
+    return 0 if r.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
